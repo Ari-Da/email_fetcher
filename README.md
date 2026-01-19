@@ -39,18 +39,20 @@ pip install -r requirements.txt
 
 1. Copy `config.py` and update the following:
    - `SENDER_EMAIL`: Your sending email address
-   - `ATTACHMENT_FILE`: Path to your resume (optional)
+   - `ATTACHMENT_FILE`: Path to your attachment file (optional)
    - `DRAFT_BODY`: Your email template (HTML format supported)
 
 ### 5. Run
 
 ```bash
-# Fetch emails
-python fetcher.py
-
-# Create draft emails
+# Create draft emails (this will automatically fetch and filter emails)
 python sender.py
+
+# Optional: Test email fetching separately to see results
+python fetcher.py
 ```
+
+**Note**: Running `sender.py` is sufficient as it automatically uses `fetcher.py` to fetch and filter emails. You can run `fetcher.py` separately if you want to test and see the fetching results without creating drafts.
 
 ## Features
 
