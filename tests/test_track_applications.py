@@ -76,6 +76,10 @@ class ClassifyTests(unittest.TestCase):
     def test_real_interview(self):
         self.assertEqual(self.status("Next steps", "We would like to invite you to an interview."), 'interview')
 
+    def test_interview_process_boilerplate_is_not_an_interview(self):
+        body = "Thanks for applying. If selected, your interview will be with our team."
+        self.assertEqual(self.status("Application received", body), 'applied')
+
     def test_assessment(self):
         self.assertEqual(self.status("Next steps", "Please complete the online assessment on HackerRank."), 'assessment')
 
@@ -106,6 +110,24 @@ class ParseMessageTests(unittest.TestCase):
         result = parse("careers@acme.com", "Thanks for applying", "Thanks for applying for the Software Engineer - Summer 2026 Intern role.")
         self.assertIn("Intern", result.role)
         self.assertEqual(result.job_type, "internship")
+
+    def test_company_name_clean_up(self):
+        self.assertEqual(tracker.clean_company("Acme and"), "Acme")
+        self.assertEqual(tracker.clean_company("Acme We"), "Acme")
+        self.assertEqual(tracker.clean_company("123 Acme Systems"), "Acme Systems")
+        self.assertIsNone(tracker.clean_company("REQ123456 Summer"))
+        self.assertIsNone(tracker.clean_company("123"))
+        self.assertIsNone(tracker.clean_company("Talent"))
+
+    def test_join_and_hq_domains(self):
+        self.assertEqual(tracker.registered_label("joinacme.com"), "acme")
+        self.assertEqual(tracker.registered_label("acmehq.com"), "acme")
+        self.assertEqual(tracker.company_key("Acme Health"), tracker.company_key("acmehealth"))
+
+    def test_assessment_and_matching_platforms_are_not_employers(self):
+        for address in ["no-reply@hackerrankforwork.com", "no-reply@ripplematch.com", "no-reply@njoyn.com"]:
+            result = parse(address, "Thanks for applying", "Thanks for applying to Globex. We review every role.")
+            self.assertEqual(result.company, "Globex")
 
     def test_hr_is_not_a_company(self):
         result = parse("no-reply@ashbyhq.com", "Thanks for applying", "Your application was sent to HR. We will review the role.")
@@ -210,14 +232,37 @@ class GroupingTests(unittest.TestCase):
         self.assertEqual(records[0]['status'], 'rejected')
         self.assertEqual(records[0]['lastUpdate'], '2026-03-10')
 
-    def test_rejection_without_role_goes_to_review_when_ambiguous(self):
+    def test_rejection_without_role_closes_oldest_unanswered_application(self):
+        records, review = self.group([
+            signal('applied', '2026-02-05', role='Data Engineer'),
+            signal('applied', '2026-02-01', role='Data Analyst'),
+            signal('rejected', '2026-03-01'),
+        ])
+        statuses = {r['role']: r['status'] for r in records}
+        self.assertEqual(statuses, {'Data Analyst': 'rejected', 'Data Engineer': 'no response'})
+        self.assertEqual(review, [])
+
+    def test_extra_rejections_become_undated_applications(self):
         records, review = self.group([
             signal('applied', '2026-02-01', role='Data Analyst'),
             signal('applied', '2026-02-01', role='Data Engineer'),
             signal('rejected', '2026-03-01'),
+            signal('rejected', '2026-03-02'),
+            signal('rejected', '2026-03-03'),
         ])
-        self.assertEqual({r['status'] for r in records}, {'no response'})
-        self.assertEqual(review[0]['reason'], 'several_applications_at_company')
+        self.assertEqual(len(records), 3)
+        self.assertEqual(sum(r['status'] == 'rejected' for r in records), 3)
+        self.assertEqual(sum(r['appliedDate'] is None for r in records), 1)
+        self.assertEqual(review, [])
+
+    def test_same_day_undated_rejections_keep_separate_ids(self):
+        records, _ = self.group([
+            signal('applied', '2026-02-01', role='Data Analyst'),
+            signal('applied', '2026-02-01', role='Data Engineer'),
+            signal('rejected', '2026-03-01'), signal('rejected', '2026-03-01'),
+            signal('rejected', '2026-03-05'), signal('rejected', '2026-03-05'),
+        ])
+        self.assertEqual(len({r['id'] for r in records}), len(records))
 
     def test_rejection_without_role_attaches_to_only_application(self):
         records, review = self.group([signal('applied', '2026-02-01', role='Data Analyst'), signal('rejected', '2026-03-01')])

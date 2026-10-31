@@ -75,12 +75,13 @@ TRACKER_ATS_DOMAINS = {
     'rippling.com', 'dover.com', 'teamtailor.com', 'recruitee.com',
     'paylocity.com', 'ultipro.com', 'ukg.com', 'adp.com', 'gem.com',
     'avature.net', 'oraclecloud.com', 'jazzhr.com', 'applytojob.com',
-    'phenompeople.com', 'tal.net',
+    'phenompeople.com', 'tal.net', 'njoyn.com', 'hackerrankforwork.com',
+    'hackerrank.com', 'panpowered.com', 'codesignal.com', 'codility.com',
 }
 TRACKER_JOB_BOARD_DOMAINS = {
     'linkedin.com', 'indeed.com', 'indeedemail.com', 'glassdoor.com',
     'ziprecruiter.com', 'joinhandshake.com', 'wellfound.com', 'simplify.jobs',
-    'dice.com', 'monster.com',
+    'dice.com', 'monster.com', 'ripplematch.com', 'talent.com',
 }
 TRACKER_PERSONAL_DOMAINS = {
     'gmail.com', 'googlemail.com', 'yahoo.com', 'hotmail.com', 'outlook.com',

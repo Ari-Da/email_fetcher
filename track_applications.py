@@ -28,7 +28,8 @@ from config import (
 
 # A confirmation and a duplicate from a job board arrive within this many days
 SAME_APPLICATION_DAYS = 1
-NEW_APPLICATION_REASONS = {'no_application_found', 'role_not_matched'}
+PROGRESS_EVERY = 200
+REJECTION_REASONS = {'no_application_found', 'role_not_matched', 'several_applications_at_company'}
 
 # Checked in this order. Rejections often open with "Thank you for applying",
 # so 'applied' has to come last.
@@ -90,10 +91,12 @@ COMPANY_PATTERNS = [
     re.compile(rf"(?i:interest in)\s+(?:joining\s+|working (?:at|with)\s+)?({COMPANY_NAME})"),
     re.compile(rf"^({COMPANY_NAME})\s+(?:Recruiting|Recruitment|Careers|Talent|Hiring)\b"),
 ]
+# Words the name pattern can run on into, as in "Acme and" or "Acme We"
+TRAILING_WORDS = re.compile(r"(?:\s+(?:and|of|We|Our|You|Your|Thank|Thanks|Please|If|This))+$")
 COMPANY_SUFFIX = re.compile(r"\s+(?:Recruiting|Recruitment|Careers?|Talent(?: Acquisition)?|Hiring(?: Team)?|Team|Jobs)$")
 NOT_COMPANIES = {
     'a', 'an', 'our', 'this', 'that', 'the', 'your', 'we', 'you', 'us', 'it', 'hiring', 'team', 'company',
-    'hr', 'human resources', 'talent acquisition', 'recruiting', 'careers', 'jobs',
+    'hr', 'human resources', 'talent', 'talent acquisition', 'recruiting', 'careers', 'jobs',
     'greenhouse', 'lever', 'workday', 'ashby', 'indeed', 'linkedin',
 }
 # Dropped only when comparing names, so "Acme" and "Acme Global" are one company
@@ -172,9 +175,13 @@ def classify(subject, sentences):
 
 
 def clean_company(name):
-    name = LEGAL_SUFFIX.sub("", name.strip().rstrip(".,!:;-'"))
+    name = re.sub(r"^\d+\s+", "", name.strip().rstrip(".,!:;-'"))
+    name = TRAILING_WORDS.sub("", name)
+    name = LEGAL_SUFFIX.sub("", name)
     name = COMPANY_SUFFIX.sub("", name).strip()
-    if not name or name.lower() in NOT_COMPANIES or re.search(rf"\b{ROLE_NOUN}\b", name):
+    # A long number means a requisition ID was picked up, not a company
+    if (not name or name.lower() in NOT_COMPANIES or re.search(rf"\b{ROLE_NOUN}\b", name)
+            or re.search(r"\d{4}", name) or not re.search(r"[A-Za-z]", name)):
         return None
     return name
 
@@ -182,8 +189,11 @@ def clean_company(name):
 def registered_label(domain):
     labels = domain.split('.')
     if len(labels) >= 3 and labels[-2] in ('co', 'com', 'ac') and len(labels[-1]) == 2:
-        return labels[-3]
-    return labels[-2] if len(labels) >= 2 else labels[0]
+        label = labels[-3]
+    else:
+        label = labels[-2] if len(labels) >= 2 else labels[0]
+    # joinacme.com and acmehq.com both belong to Acme
+    return re.sub(r"^join(?=.{3})|(?<=.{3})hq$", "", label)
 
 
 def matches_domain(domain, known_domains):
@@ -350,12 +360,16 @@ def find_applied_record(records, signal):
 
 # Finds the record a response belongs to, or says why it can't. Never guesses:
 # a response to the wrong job is worse than a line in the review list.
-def find_response_record(records, signal):
-    candidates = [
+def response_candidates(records, signal):
+    return [
         r for r in records
         if company_key(r['company']) == company_key(signal.company)
         and (r['appliedAt'] is None or r['appliedAt'] <= signal.date)
     ]
+
+
+def find_response_record(records, signal):
+    candidates = response_candidates(records, signal)
     if not candidates:
         return None, 'no_application_found'
     if signal.role:
@@ -369,6 +383,13 @@ def find_response_record(records, signal):
     if len(candidates) == 1:
         return candidates[0], None
     return None, 'several_applications_at_company'
+
+
+# For a rejection with no role, the role may be a guess but the rejection count
+# stays right: it closes the company's oldest unanswered application.
+def oldest_open_application(records, signal):
+    unanswered = [r for r in response_candidates(records, signal) if not r['firstResponseAt']]
+    return min(unanswered, key=lambda r: r['appliedAt'], default=None)
 
 
 def review_entry(signal, reason):
@@ -446,6 +467,17 @@ def finish_review(entry, labels):
     }
 
 
+# Undated rows for one company can share a rejection date, so later ones get a
+# number. Records are processed in date order, which keeps this stable.
+def unique_ids(finished):
+    seen = {}
+    for row in finished:
+        base = row['id']
+        seen[base] = seen.get(base, 0) + 1
+        if seen[base] > 1:
+            row['id'] = record_id(base, str(seen[base]))
+
+
 # Groups signals into one record per application plus a needs-review list.
 def group_signals(signals, today, labels):
     records, review = [], []
@@ -474,10 +506,13 @@ def group_signals(signals, today, labels):
         record, reason = find_response_record(records, signal)
         # A rejection proves she applied, even with no confirmation email. The
         # application date stays unknown rather than borrowing the rejection's.
-        if signal.status == 'rejected' and reason in NEW_APPLICATION_REASONS:
-            record, reason = new_record(signal), None
-            record['appliedAt'] = None
-            records.append(record)
+        if signal.status == 'rejected' and reason in REJECTION_REASONS:
+            record = oldest_open_application(records, signal) if not signal.role else None
+            reason = None
+            if not record:
+                record = new_record(signal)
+                record['appliedAt'] = None
+                records.append(record)
         if reason:
             review.append(review_entry(signal, reason))
             continue
@@ -489,6 +524,7 @@ def group_signals(signals, today, labels):
         record['accounts'].add(signal.account)
 
     finished = [finish_record(record, today, labels) for record in records]
+    unique_ids(finished)
     finished.sort(key=lambda r: (r['appliedDate'] or r['lastUpdate'], r['company']), reverse=True)
     review.sort(key=lambda r: r['date'], reverse=True)
     return finished, review
@@ -551,6 +587,8 @@ def scan_account(service, account, start_date, known_ids, limit=None):
         signal = parse_message(gmail_client.get_message(service, message_id), account)
         if signal:
             signals.append(signal)
+        if scanned % PROGRESS_EVERY == 0:
+            print(f"{account}: read {scanned} emails so far")
     print(f"{account}: searched from {start_date}, read {scanned} new emails, kept {len(signals)}")
     return signals
 

@@ -95,8 +95,11 @@ How the tracker decides:
 - **Connecting emails**: emails are grouped by company and role, so a confirmation and a later rejection form one application.
 - **Type**: the job title decides. A title mentioning intern is `internship`, and any other title is `full-time`. With no role, the type comes from what the emails say, otherwise it stays `unknown`.
 - **Rejections with no confirmation**: they count as applications, because she can't be rejected without applying. Their `appliedDate` is empty, meaning unknown, so they don't appear in date-based stats. Other responses with no application, such as interview invitations, go to needs review.
+- **Rejections with no role at a company with several applications**: each closes the oldest unanswered application there, and any extra rejections count as new applications with an unknown date. The role may be wrong in these cases, but the rejection totals are right.
 
 If an account fails, for example because its login is blocked, it is skipped and the other accounts still run and save. The run lists skipped accounts and ends with exit code 2, and a skipped account resumes from where it left off next time. To stop using an account, remove it from `settings.json`.
+
+Gmail limits requests per minute, so the tracker reads at a steady pace and waits and retries when Gmail asks it to slow down. A large mailbox can take several minutes on the first run, and progress is printed as it goes.
 
 A run with no terminal can't open a browser, so that account is skipped instead of hanging. A login in a terminal gives up after 3 minutes.
 

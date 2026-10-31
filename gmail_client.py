@@ -2,6 +2,7 @@ import base64
 import os
 import re
 import sys
+import time
 
 from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
@@ -16,6 +17,11 @@ PAGE_SIZE = 100
 
 # Under this length a text/plain part is usually a "view in browser" stub
 MIN_PLAIN_BODY = 200
+
+# Gmail limits requests per minute. Pacing avoids most refusals, and retries
+# wait out the rest with growing delays that outlast the one-minute window.
+SECONDS_BETWEEN_READS = 0.1
+GMAIL_RETRIES = 8
 
 # A login blocked by an organization never reports back, so don't wait forever
 LOGIN_TIMEOUT_SECONDS = 180
@@ -108,7 +114,7 @@ def search_message_ids(service, query):
     while True:
         results = service.users().messages().list(
             userId="me", q=query, maxResults=PAGE_SIZE, pageToken=page_token
-        ).execute(num_retries=3)
+        ).execute(num_retries=GMAIL_RETRIES)
         for message in results.get("messages", []):
             yield message["id"]
         page_token = results.get("nextPageToken")
@@ -117,9 +123,10 @@ def search_message_ids(service, query):
 
 
 def get_message(service, message_id):
+    time.sleep(SECONDS_BETWEEN_READS)
     return service.users().messages().get(
         userId="me", id=message_id, format="full"
-    ).execute(num_retries=3)
+    ).execute(num_retries=GMAIL_RETRIES)
 
 
 def get_header(message, name):
