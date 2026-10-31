@@ -62,6 +62,24 @@ class ClassifyTests(unittest.TestCase):
         body = "Thank you for applying. We have decided to move forward with other candidates."
         self.assertEqual(self.status("Your application", body), 'rejected')
 
+    def test_polite_rejection_wording(self):
+        for body in ["Thank you for your interest. We think you are not the strongest fit here, and this job isn\u2019t a good match.",
+                     "Thanks for applying. We won\u2019t be moving forward with your application.",
+                     "Thank you for your interest. You are not quite the right fit for this role.",
+                     "Thanks for applying. We have decided to go in a different direction.",
+                     "Thanks for applying. We chose people who more closely match the position.",
+                     "Thanks for applying. You are no longer being considered.",
+                     "Thanks for applying. This position has been closed.",
+                     "After review, we have decided to progress with other candidates for this role.",
+                     "We have selected other applicants for this role."]:
+            self.assertEqual(self.status("Your application", body), 'rejected', body)
+
+    def test_ordinary_confirmation_is_not_a_rejection(self):
+        for body in ["Thanks for applying. We will see if your experience is a fit for the role.",
+                     "Thank you for your interest. We look for the best match for each role.",
+                     "Thanks for applying. If this role is not a match, we will keep your resume."]:
+            self.assertEqual(self.status("Application received", body), 'applied', body)
+
     def test_will_not_move_forward_is_rejected(self):
         self.assertEqual(self.status("Update", "We will not be moving forward with your application."), 'rejected')
 
@@ -314,7 +332,7 @@ class GroupingTests(unittest.TestCase):
         self.assertEqual(records[0]['emailUrl'], tracker.email_link(ACCOUNT_B, rejected.message_id))
 
     def test_email_link_names_the_account_and_message(self):
-        self.assertEqual(tracker.email_link(ACCOUNT_A, 'abc'), f'https://mail.google.com/mail/u/{ACCOUNT_A}/#all/abc')
+        self.assertEqual(tracker.email_link(ACCOUNT_A, 'abc'), 'https://mail.google.com/mail/?authuser=a%40example.com#all/abc')
 
     def test_same_day_duplicate_without_role_merges(self):
         records, _ = self.group([
@@ -673,7 +691,7 @@ class ResumeTests(unittest.TestCase):
         self.assertTrue(saved['applications'][0]['needsReview'])
         self.assertEqual(saved['applications'][0]['reviewReason'], 'no_application_found')
         self.assertNotIn("careers@", json.dumps(saved))
-        self.assertTrue(saved['applications'][0]['emailUrl'].endswith('/#all/cold'))
+        self.assertTrue(saved['applications'][0]['emailUrl'].endswith('#all/cold'))
 
     def test_state_file_is_private_and_holds_no_email_text(self):
         self.run_tracker(['1'])

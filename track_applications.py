@@ -5,6 +5,7 @@ import os
 import re
 from dataclasses import asdict, dataclass
 from email.utils import parseaddr
+from urllib.parse import quote
 from typing import Optional
 
 from bs4 import BeautifulSoup
@@ -35,12 +36,17 @@ STATUS_PATTERNS = [
         r"regret to inform"
         r"|\b(?:not|won'?t|unable to|cannot|can'?t)\b[^.!?]{0,40}\b(?:mov\w+|proceed\w*|go\w*)\s+forward"
         r"|\bnot be (?:moving|proceeding|progressing)\b"
-        r"|\b(?:mov\w+|proceed\w*|pursu\w+|go\w*)\b[^.!?]{0,40}\bother (?:candidates|applicants)\b"
+        r"|\b(?:mov\w+|proceed\w*|pursu\w+|go\w*|progress\w*|advanc\w+|continu\w+|select\w*|chos\w+|choos\w+)\b"
+        r"[^.!?]{0,40}\bother (?:candidates|applicants)\b"
         r"|\bnot (?:been )?selected\b"
         r"|\bposition has been filled\b"
         r"|\bno longer (?:considering|under consideration)\b"
         r"|\bdecided not to\b"
-        r"|\bnot (?:the right|a) (?:fit|match)\b", re.I)),
+        r"|\b(?:not|isn't|aren't|wasn't|weren't)\s+(?:be\s+)?(?:quite\s+|really\s+|exactly\s+)?(?:a|an|the)?\s*(?:\w+\s+)?(?:fit|match)\b"
+        r"|\bdifferent direction\b"
+        r"|\b(?:more|better|closely)\s+(?:closely\s+)?(?:align|match|fit)\w*\b[^.!?]{0,40}\b(?:role|position|requirements|needs)\b"
+        r"|\bno longer being considered\b"
+        r"|\b(?:role|position|requisition|opening)\b[^.!?]{0,30}\b(?:has been|was|is now)\s+(?:closed|cancell?ed|filled)\b", re.I)),
     ('offer', re.compile(
         r"\bpleased to (?:offer|extend)\b"
         r"|\bextend(?:ing)? (?:you )?an offer\b"
@@ -146,6 +152,8 @@ def clean_body(raw_body):
 # Hard-wrapped plain text breaks lines mid-sentence, so only a blank line or
 # end punctuation counts as a boundary.
 def split_sentences(text):
+    # Curly apostrophes would otherwise hide words like "won't" and "isn't"
+    text = text.replace("\u2019", "'")
     text = re.sub(r"[ \t\r\f\v\xa0]+", " ", text)
     sentences = []
     for block in re.split(r"\n\s*\n", text):
@@ -321,7 +329,7 @@ def days_between(first, second):
 
 
 def email_link(account, message_id):
-    return f"https://mail.google.com/mail/u/{account}/#all/{message_id}"
+    return f"https://mail.google.com/mail/?authuser={quote(account, safe='')}#all/{message_id}"
 
 
 def new_record(signal):
