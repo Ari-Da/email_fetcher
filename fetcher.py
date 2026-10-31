@@ -1,19 +1,14 @@
-import os.path
 import datetime
 import base64
 import re
 
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
 from bs4 import BeautifulSoup
+
+import gmail_client
+from settings import load_settings
 
 # Import configuration
 from config import (
-    GMAIL_READONLY_SCOPES,
-    CREDENTIALS_FILE,
-    TOKEN_FETCHER_FILE,
     MAX_RESULTS,
     DAYS_BACK,
     EMAIL_KEYWORDS,
@@ -120,33 +115,18 @@ def extract_company_from_subject(subject):
 
 # Fetch and return list of email results
 def fetch_emails():
-    creds = None
-    # The file token.json stores the user's access and refresh tokens, and is
-    # created automatically when the authorization flow completes for the first time.
-    # Check if token file exists and is not empty
-    if os.path.exists(TOKEN_FETCHER_FILE) and os.path.getsize(TOKEN_FETCHER_FILE) > 0:
+    email_results = []
+    for account in load_settings()['recruiter_accounts']:
+        print(f"\nAccount: {account}")
         try:
-            creds = Credentials.from_authorized_user_file(TOKEN_FETCHER_FILE, GMAIL_READONLY_SCOPES)
-        except (ValueError, Exception):
-            # If token file is invalid, treat as if it doesn't exist
-            creds = None
-    
-    # If there are no (valid) credentials available, let the user log in.
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                CREDENTIALS_FILE, GMAIL_READONLY_SCOPES
-            )
-            creds = flow.run_local_server(port=0)
-        # Save the credentials for the next run
-        with open(TOKEN_FETCHER_FILE, "w") as token:
-            token.write(creds.to_json())
+            email_results.extend(fetch_account_emails(gmail_client.connect(account)))
+        except (Exception, SystemExit) as error:
+            # One account failing never stops the others
+            print(f"{account}: skipped. {error}")
+    return email_results
 
-    # Build the Gmail service
-    service = build("gmail", "v1", credentials=creds)
-
+# Runs the recruiter search on one connected account
+def fetch_account_emails(service):
     # 1. Calculate Date
     date_limit = datetime.date.today() - datetime.timedelta(days=DAYS_BACK)
     date_query = date_limit.strftime('%Y/%m/%d')

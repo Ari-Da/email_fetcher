@@ -14,7 +14,10 @@ ENV/
 # Sensitive files - DO NOT COMMIT
 credentials.json
 tokens/
+data/
 *.json
+!settings.example.json
+draft_body.html
 *.backup
 
 # IDE

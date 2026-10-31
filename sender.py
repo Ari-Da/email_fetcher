@@ -6,6 +6,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -13,6 +14,8 @@ from googleapiclient.discovery import build
 
 # Import from fetcher
 from fetcher import fetch_emails
+import gmail_client
+from settings import load_settings
 
 # Import configuration
 from config import (
@@ -21,11 +24,7 @@ from config import (
     TOKEN_SENDER_FILE,
     EMAIL_KEYWORDS,
     JOB_KEYWORDS,
-    LINKEDIN_DOMAINS,
-    DRAFT_SUBJECT,
-    DRAFT_BODY,
-    SENDER_EMAIL,
-    ATTACHMENT_FILE
+    LINKEDIN_DOMAINS
 )
 
 # Extract email address from sender string like 'Name <email@domain.com>' or 'email@domain.com'
@@ -107,6 +106,11 @@ def create_draft_message(service, to_email, subject, body, from_email=None, atta
     return draft
 
 def main():
+    settings = load_settings()
+    destination_email = settings['destination_email']
+    with open(settings['draft_body_file']) as body_file:
+        draft_body = body_file.read()
+
     # Get email results from fetcher
     email_results = fetch_emails()
     
@@ -127,38 +131,42 @@ def main():
     
     # If there are no (valid) credentials available, let the user log in.
     if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+        try:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                creds = None
+        except RefreshError:
+            creds = None
+        if not creds:
+            if not gmail_client.can_open_browser():
+                raise gmail_client.LoginNeeded(f"{destination_email} needs a browser login. Run this once from a terminal.")
             flow = InstalledAppFlow.from_client_secrets_file(
                 CREDENTIALS_FILE, GMAIL_COMPOSE_SCOPES
             )
-            creds = flow.run_local_server(port=0)
+            creds = flow.run_local_server(port=0, login_hint=destination_email)
         # Save the credentials for the next run
-        with open(TOKEN_SENDER_FILE, "w") as token:
-            token.write(creds.to_json())
+        gmail_client.save_private(TOKEN_SENDER_FILE, creds.to_json())
 
     # Build the Gmail service
     service = build("gmail", "v1", credentials=creds)
     
-    # Verify sender email is configured
-    if not SENDER_EMAIL:
-        print("ERROR: SENDER_EMAIL is not configured in config.py")
-        print("Please set SENDER_EMAIL to the email address you want to send from.")
-        return
-    
     # Get the authenticated user's email (this is the sending account)
     profile = service.users().getProfile(userId="me").execute()
     authenticated_email = profile.get("emailAddress", "Unknown")
-    print(f"Authenticated sending account: {authenticated_email}")
-    print(f"Drafts will be created in: {authenticated_email}")
-    print(f"From address will be set to: {SENDER_EMAIL}\n")
+    if authenticated_email.lower() != destination_email.lower():
+        os.remove(TOKEN_SENDER_FILE)
+        print(f"ERROR: logged in as {authenticated_email}, expected {destination_email}. No drafts created.")
+        return
+    print(f"Drafts will be created in: {authenticated_email}\n")
     
     # Process each email result
     drafts_created = 0
     skipped = 0
+    drafted_for = set()
     
-    print("\nProcessing results for draft creation:\n")
+    print("\n\nProcessing results for draft creation:\n")
+    print("-" * 40)
     
     for email_result in email_results:
         subject = email_result['subject']
@@ -166,29 +174,35 @@ def main():
         
         # Filter: Skip LinkedIn senders
         if is_linkedin_sender(sender):
-            print(f"Skipping LinkedIn sender: {sender}")
+            # print(f"Skipping LinkedIn sender: {sender}")
             skipped += 1
             continue
         
         # Filter: Check if subject contains keywords
         if not subject_contains_keywords(subject):
-            print(f"Skipping - subject doesn't contain keywords: {subject}")
+            # print(f"Skipping - subject doesn't contain keywords: {subject}")
             skipped += 1
             continue
         
         # Extract email address from sender
         to_email = extract_email_address(sender)
         if not to_email:
-            print(f"Skipping - could not extract email from: {sender}")
+            # print(f"Skipping - could not extract email from: {sender}")
             skipped += 1
             continue
         
+        # One draft per recruiter, even if they emailed several accounts
+        if to_email.lower() in drafted_for:
+            skipped += 1
+            continue
+        drafted_for.add(to_email.lower())
+        
         # Create draft
         try:
-            draft = create_draft_message(service, to_email, DRAFT_SUBJECT, DRAFT_BODY, SENDER_EMAIL, ATTACHMENT_FILE)
+            draft = create_draft_message(service, to_email, settings['draft_subject'], draft_body, destination_email, settings['attachment_file'])
             print("-" * 40)
             print(f"Draft created for: {to_email}")
-            print(f"  From: {SENDER_EMAIL}")
+            print(f"  From: {destination_email}")
             print(f"  Original subject: {subject}")
             drafts_created += 1
         except Exception as e:

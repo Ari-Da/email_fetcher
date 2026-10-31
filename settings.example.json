@@ -1,0 +1,17 @@
+{
+  "features": {
+    "application_tracker": true,
+    "recruiter": false
+  },
+  "recruiter_accounts": [
+    "you@example.com"
+  ],
+  "application_accounts": [
+    "you@example.com",
+    "another@example.com"
+  ],
+  "destination_email": "you@example.com",
+  "draft_subject": "Your draft subject",
+  "draft_body_file": "draft_body.html",
+  "attachment_file": ""
+}

@@ -1,12 +1,22 @@
 # Email Fetcher
 
-A Python script that automatically fetches job-related emails from Gmail and creates draft response emails.
+A Python tool that uses the Gmail API to track job applications and their responses, and to find recruiter emails and draft replies to them.
 
 ## Overview
 
-This project consists of two main scripts:
-- **`fetcher.py`**: Fetches emails matching job-related keywords from your Gmail account
-- **`sender.py`**: Creates draft emails to respond to job opportunities
+The project has two features, which run separately and can each use several Gmail accounts:
+
+- **Application tracker**: finds jobs applied to and the responses to them, such as rejections, interviews and offers. It is read-only and is meant to run daily on a schedule.
+- **Recruiter finder**: finds recruiter emails and creates draft replies. It is meant to run on command.
+
+| File | Purpose |
+|---|---|
+| `run.py` | Starts either feature or both |
+| `track_applications.py` | Application tracker |
+| `fetcher.py`, `sender.py` | Recruiter finder: search, then drafts |
+| `gmail_client.py` | Shared read-only Gmail login, search and email reading |
+| `settings.py`, `settings.json` | Loads your private settings |
+| `config.py` | Public, non-personal defaults |
 
 ## Setup
 
@@ -23,7 +33,7 @@ This project consists of two main scripts:
 
 ### 2. Add Test Users
 
-**Important**: Add all email accounts you'll use (both fetching and sending accounts) as **Test Users** in the OAuth consent screen:
+**Important**: Add every email account you'll use (tracker, recruiter and draft accounts) as **Test Users** in the OAuth consent screen:
 - Go to **APIs & Services** → **OAuth consent screen**
 - Under **Test users**, click **Add Users**
 - Add your email addresses
@@ -37,31 +47,74 @@ pip install -r requirements.txt
 
 ### 4. Configuration
 
-1. Copy `config.py` and update the following:
-   - `SENDER_EMAIL`: Your sending email address
-   - `ATTACHMENT_FILE`: Path to your attachment file (optional)
-   - `DRAFT_BODY`: Your email template (HTML format supported)
+See [Settings](#settings) below.
 
 ### 5. Run
 
-```bash
-# Create draft emails (this will automatically fetch and filter emails)
-python sender.py
+See [Running](#running). Each account opens a browser login the first time.
 
-# Optional: Test email fetching separately to see results
-python fetcher.py
+## Settings
+
+Copy `settings.example.json` to `settings.json` and fill it in. Put the draft text in `draft_body.html`. Git ignores both, so addresses stay off GitHub. Never put personal values in `config.py`, which is public.
+
+- `features`: what `python run.py` runs, and so what a schedule runs
+- `recruiter_accounts`: inboxes the recruiter finder searches
+- `application_accounts`: inboxes the application tracker searches
+- `destination_email`: the one account that holds the drafts
+
+Add every address as a **Test User** (see step 2 above).
+
+## Running
+
+```bash
+python run.py              # whatever is switched on in settings.json
+python run.py tracker      # application tracker only
+python run.py recruiter    # recruiter finder and drafts only
+python run.py all          # both
+python fetcher.py          # recruiter results only, no drafts
 ```
 
-**Note**: Running `sender.py` is sufficient as it automatically uses `fetcher.py` to fetch and filter emails. You can run `fetcher.py` separately if you want to test and see the fetching results without creating drafts.
+Tracker options: `--limit 50` tests on a few emails without saving progress, and `--full` rescans from the start date.
+
+The tracker finds every application in the listed accounts since the start date. It does not depend on any job list, so a job counts whether or not it was ever saved anywhere else.
+
+| File in `data/` | Holds | Goes to the page? |
+|---|---|---|
+| `applications.json` | One row per application, plus flagged needs-review rows | Yes, after review |
+| `tracker_state.json` | How far each account got, and the basic results of each email kept | No |
+| `review_messages.json` | Gmail message IDs for opening needs-review items | No |
+| `applications_test.json` | Results of `--limit` test runs | No |
+
+All of these are ignored by git. None holds email text, subjects or sender names, and `applications.json` holds no email addresses: accounts appear as `Account 1`, numbered by their order in `settings.json`.
+
+Each row has `id`, `company`, `role`, `appliedDate`, `type` (`full-time`, `internship` or `unknown`), `status` (`applied`, `rejected`, `assessment`, `interview`, `offer` or `no response`), `lastUpdate`, `sourceAccount` and `needsReview`. Needs-review rows also have `reviewReason`. A row becomes `no response` after 30 days with no reply.
+
+If an account fails, for example because its login is blocked, it is skipped and the other accounts still run and save. The run lists skipped accounts and ends with exit code 2, and a skipped account resumes from where it left off next time. To stop using an account, remove it from `settings.json`.
+
+A run with no terminal can't open a browser, so that account is skipped instead of hanging. A login in a terminal gives up after 3 minutes.
+
+To run the tests: `python -m unittest discover -s tests`
 
 ## Features
 
+Application tracker:
+
+- Records company, role, date, full-time or internship, and latest status for each application
+- Counts a job seen in several accounts once, keeping the earliest date
+- Sends unclear cases to a needs-review list instead of guessing
+- Only reads new email on each run
+
+Recruiter finder:
+
 - Filters emails by job-related keywords
 - Extracts company and position information
-- Creates draft emails with attachments
+- Creates one draft per recruiter in a single destination account, with attachments
 - Supports HTML email formatting with clickable links
 
 ## Security
 
-- Token files and credentials are excluded from version control (see `.gitignore`)
-- Never commit `credentials.json` or files in the `tokens/` folder
+- Tokens, credentials, settings, draft text and results are excluded from version control (see `.gitignore`)
+- Never commit `credentials.json`, `settings.json`, `draft_body.html`, or anything in `tokens/` or `data/`
+- Logging in happens in Google's own browser page. The scripts never see a password
+- `gmail_client.py` refuses any token that can do more than read mail. Only `sender.py` has draft access, and it only creates drafts. Google has no drafts-only permission, so that token could technically send mail
+- Remove access at any time at https://myaccount.google.com/permissions
