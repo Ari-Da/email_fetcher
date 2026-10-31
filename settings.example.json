@@ -13,5 +13,8 @@
   "destination_email": "you@example.com",
   "draft_subject": "Your draft subject",
   "draft_body_file": "draft_body.html",
-  "attachment_file": ""
+  "attachment_file": "",
+  "excluded_companies": [
+    "Company To Ignore"
+  ]
 }

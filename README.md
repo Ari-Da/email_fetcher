@@ -61,6 +61,7 @@ Copy `settings.example.json` to `settings.json` and fill it in. Put the draft te
 - `recruiter_accounts`: inboxes the recruiter finder searches
 - `application_accounts`: inboxes the application tracker searches
 - `destination_email`: the one account that holds the drafts
+- `excluded_companies`: employers the tracker leaves out, with no rescan needed
 
 Add every address as a **Test User** (see step 2 above).
 
@@ -88,6 +89,12 @@ The tracker finds every application in the listed accounts since the start date.
 All of these are ignored by git. None holds email text, subjects or sender names, and `applications.json` holds no email addresses: accounts appear as `Account 1`, numbered by their order in `settings.json`.
 
 Each row has `id`, `company`, `role`, `appliedDate`, `type` (`full-time`, `internship` or `unknown`), `status` (`applied`, `rejected`, `assessment`, `interview`, `offer` or `no response`), `lastUpdate`, `sourceAccount` and `needsReview`. Needs-review rows also have `reviewReason`. A row becomes `no response` after 30 days with no reply.
+
+How the tracker decides:
+
+- **Connecting emails**: emails are grouped by company and role, so a confirmation and a later rejection form one application.
+- **Type**: the job title decides. A title mentioning intern is `internship`, and any other title is `full-time`. With no role, the type comes from what the emails say, otherwise it stays `unknown`.
+- **Rejections with no confirmation**: they count as applications, because she can't be rejected without applying. Their `appliedDate` is empty, meaning unknown, so they don't appear in date-based stats. Other responses with no application, such as interview invitations, go to needs review.
 
 If an account fails, for example because its login is blocked, it is skipped and the other accounts still run and save. The run lists skipped accounts and ends with exit code 2, and a skipped account resumes from where it left off next time. To stop using an account, remove it from `settings.json`.
 

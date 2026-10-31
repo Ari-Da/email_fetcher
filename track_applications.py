@@ -28,6 +28,7 @@ from config import (
 
 # A confirmation and a duplicate from a job board arrive within this many days
 SAME_APPLICATION_DAYS = 1
+NEW_APPLICATION_REASONS = {'no_application_found', 'role_not_matched'}
 
 # Checked in this order. Rejections often open with "Thank you for applying",
 # so 'applied' has to come last.
@@ -92,8 +93,11 @@ COMPANY_PATTERNS = [
 COMPANY_SUFFIX = re.compile(r"\s+(?:Recruiting|Recruitment|Careers?|Talent(?: Acquisition)?|Hiring(?: Team)?|Team|Jobs)$")
 NOT_COMPANIES = {
     'a', 'an', 'our', 'this', 'that', 'the', 'your', 'we', 'you', 'us', 'it', 'hiring', 'team', 'company',
+    'hr', 'human resources', 'talent acquisition', 'recruiting', 'careers', 'jobs',
     'greenhouse', 'lever', 'workday', 'ashby', 'indeed', 'linkedin',
 }
+# Dropped only when comparing names, so "Acme" and "Acme Global" are one company
+NAME_VARIANT = re.compile(r"\s+(?:ai|global|technologies|technology|group|holdings|labs)$", re.I)
 LEGAL_SUFFIX = re.compile(r"[,\s]+(?:inc|incorporated|llc|ltd|limited|corp|corporation|co|plc|gmbh)\.?$", re.I)
 ATS_LABEL_DISPLAY = re.compile(r"^(.+?)\s+(?:Recruiting|Recruitment|Careers|Talent(?: Acquisition)?|Hiring(?: Team)?|Jobs|HR)\b")
 GENERIC_SUBDOMAINS = {'www', 'mail', 'email', 'e', 'em', 't', 'us', 'eu', 'hire', 'jobs', 'careers', 'notifications', 'no-reply', 'noreply'}
@@ -101,7 +105,7 @@ GENERIC_MAILBOXES = {'no-reply', 'noreply', 'do-not-reply', 'donotreply', 'notif
 
 ROLE_NOUN = (r"(?:Engineer|Developer|Scientist|Analyst|Researcher|Designer|Manager|Consultant|Architect"
              r"|Intern|Internship|Co-?op|Associate|Specialist|Programmer)")
-ROLE_NAME = rf"\b(?:[A-Z][\w+#/&.\-]{{0,30}}[ ,]+){{0,6}}?{ROLE_NOUN}(?:[ ,\-]+(?:Internship|Intern|Co-?op|I{{1,3}}\b))?(?:\s*\([^)]{{1,30}}\))?"
+ROLE_NAME = rf"\b(?:[A-Z][\w+#/&.\-]{{0,30}}[ ,]+){{0,6}}?{ROLE_NOUN}(?:[ ,\-]+(?:(?:Summer|Fall|Winter|Spring)[ ]+)?(?:\d{{4}}[ ]+)?(?:Internship|Intern|Co-?op|I{{1,3}}\b))?(?:\s*\([^)]{{1,30}}\))?"
 ROLE_CONTEXT = [
     re.compile(rf"(?i:for|to|as)\s+(?:(?i:the|our|a|an)\s+)?(?:(?i:position|role)\s+(?i:of)\s+)?({ROLE_NAME})"),
     re.compile(rf"({ROLE_NAME})\s+(?i:position|role|opening|opportunity|at)\b"),
@@ -231,6 +235,9 @@ def find_company(sender, subject, sentences):
 
 def clean_role(role):
     role = re.sub(r"\s+", " ", role).strip(" ,-")
+    # Requisition numbers: "REQ123456 Data Engineer", "Analyst (Job number: 2000)"
+    role = re.sub(r"^[A-Z]*-?\d{4,}\s+", "", role)
+    role = re.sub(r"\s*\((?:Job number:\s*)?\d+\)", "", role)
     if NOT_ROLES.match(role):
         return None
     return role
@@ -290,7 +297,7 @@ def parse_message(message, account):
 
 def company_key(name):
     name = re.sub(r"\s*\(Tier \d+\)\s*$", "", name or "", flags=re.I)
-    name = LEGAL_SUFFIX.sub("", name.strip())
+    name = NAME_VARIANT.sub("", LEGAL_SUFFIX.sub("", name.strip()))
     return re.sub(r"[^a-z0-9]+", "", name.lower())
 
 
@@ -299,7 +306,7 @@ def role_key(role):
         return ""
     role = re.sub(r"\([^)]*\)", " ", role.lower())
     role = re.sub(r"\binternship\b", "intern", role)
-    return " ".join(re.findall(r"[a-z0-9+#]+", role))
+    return " ".join(word for word in re.findall(r"[a-z0-9+#]+", role) if not re.search(r"\d{4}", word))
 
 
 def days_between(first, second):
@@ -333,12 +340,12 @@ def find_applied_record(records, signal):
     for record in same_company:
         if record['role'] and signal.role and role_key(record['role']) == role_key(signal.role):
             return record
-    if len(same_company) == 1:
-        record = same_company[0]
-        one_lacks_role = not record['role'] or not signal.role
-        if one_lacks_role and days_between(record['appliedAt'], signal.date) <= SAME_APPLICATION_DAYS:
-            return record
-    return None
+    nearby = [
+        r for r in same_company
+        if (not r['role'] or not signal.role)
+        and days_between(r['appliedAt'], signal.date) <= SAME_APPLICATION_DAYS
+    ]
+    return nearby[0] if len(nearby) == 1 else None
 
 
 # Finds the record a response belongs to, or says why it can't. Never guesses:
@@ -346,7 +353,8 @@ def find_applied_record(records, signal):
 def find_response_record(records, signal):
     candidates = [
         r for r in records
-        if company_key(r['company']) == company_key(signal.company) and r['appliedAt'] <= signal.date
+        if company_key(r['company']) == company_key(signal.company)
+        and (r['appliedAt'] is None or r['appliedAt'] <= signal.date)
     ]
     if not candidates:
         return None, 'no_application_found'
@@ -397,14 +405,23 @@ def source_label(accounts, labels):
     return ", ".join(sorted(labels[account] for account in accounts))
 
 
-def finish_record(record, today, labels):
+# The job title decides: a named role without "intern" in it counts as
+# full-time. With no role, what the emails say is used instead.
+def final_type(record):
+    if record['role']:
+        return 'internship' if INTERNSHIP.search(record['role']) else 'full-time'
     known = record['types'] - {'unknown'}
+    return known.pop() if len(known) == 1 else 'unknown'
+
+
+def finish_record(record, today, labels):
     return {
-        'id': record_id(company_key(record['company']), role_key(record['role']), record['appliedAt']),
+        'id': record_id(company_key(record['company']), role_key(record['role']),
+                        record['appliedAt'] or record['firstResponseAt']),
         'company': record['company'],
         'role': record['role'],
         'appliedDate': record['appliedAt'],
-        'type': known.pop() if len(known) == 1 else 'unknown',
+        'type': final_type(record),
         'status': final_status(record, today),
         'lastUpdate': record['lastUpdateAt'],
         'sourceAccount': source_label(record['accounts'], labels),
@@ -455,17 +472,24 @@ def group_signals(signals, today, labels):
             review.append(review_entry(signal, 'company_not_found'))
             continue
         record, reason = find_response_record(records, signal)
+        # A rejection proves she applied, even with no confirmation email. The
+        # application date stays unknown rather than borrowing the rejection's.
+        if signal.status == 'rejected' and reason in NEW_APPLICATION_REASONS:
+            record, reason = new_record(signal), None
+            record['appliedAt'] = None
+            records.append(record)
         if reason:
             review.append(review_entry(signal, reason))
             continue
         record['latestStatus'] = signal.status
+        record['role'] = record['role'] or signal.role
         record['firstResponseAt'] = record['firstResponseAt'] or signal.date
         record['lastUpdateAt'] = signal.date
         record['types'].add(signal.job_type)
         record['accounts'].add(signal.account)
 
     finished = [finish_record(record, today, labels) for record in records]
-    finished.sort(key=lambda r: (r['appliedDate'], r['company']), reverse=True)
+    finished.sort(key=lambda r: (r['appliedDate'] or r['lastUpdate'], r['company']), reverse=True)
     review.sort(key=lambda r: r['date'], reverse=True)
     return finished, review
 
@@ -531,6 +555,12 @@ def scan_account(service, account, start_date, known_ids, limit=None):
     return signals
 
 
+# Applied after loading, so changing the list needs no rescan.
+def without_excluded(signals, excluded_companies):
+    excluded = {company_key(company) for company in excluded_companies}
+    return [s for s in signals if company_key(s.company) not in excluded]
+
+
 # A --limit test keeps its results out of the state, so a later real run still
 # covers everything. Other runs save after each account, and only once that
 # account has finished, so a failed run is simply retried.
@@ -574,7 +604,8 @@ def run(settings, full=False, limit=None):
     # Accounts removed from settings drop out of the results
     saved = [Signal(**s) for s in state['signals'] if s['account'] in accounts]
     labels = account_labels(accounts)
-    applications, review = group_signals(saved + test_signals, today, labels)
+    kept = without_excluded(saved + test_signals, settings.get('excluded_companies', []))
+    applications, review = group_signals(kept, today, labels)
     review_rows = [finish_review(entry, labels) for entry in review]
 
     stats = build_stats(applications, review)

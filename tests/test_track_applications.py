@@ -102,6 +102,19 @@ class ParseMessageTests(unittest.TestCase):
                        "Thank you for applying to Globex. We review every resume.")
         self.assertEqual(result.company, "Globex")
 
+    def test_intern_after_season_stays_in_the_role(self):
+        result = parse("careers@acme.com", "Thanks for applying", "Thanks for applying for the Software Engineer - Summer 2026 Intern role.")
+        self.assertIn("Intern", result.role)
+        self.assertEqual(result.job_type, "internship")
+
+    def test_hr_is_not_a_company(self):
+        result = parse("no-reply@ashbyhq.com", "Thanks for applying", "Your application was sent to HR. We will review the role.")
+        self.assertIsNone(result.company)
+
+    def test_tal_is_a_hiring_system(self):
+        result = parse("no-reply@tal.net", "Thanks for applying", "Thanks for applying to Globex. We review every role.")
+        self.assertEqual(result.company, "Globex")
+
     def test_role_at_company_through_ats(self):
         result = parse("no-reply@ashbyhq.com", "Thanks for applying",
                        "Thanks for applying for the Software Engineer Intern role at Initech.")
@@ -225,7 +238,7 @@ class GroupingTests(unittest.TestCase):
         self.assertEqual(review[0]['reason'], 'role_not_matched')
 
     def test_response_before_application_is_not_counted(self):
-        records, review = self.group([signal('applied', '2026-03-01'), signal('rejected', '2026-02-01')])
+        records, review = self.group([signal('applied', '2026-03-01'), signal('interview', '2026-02-01')])
         self.assertEqual(records[0]['status'], 'no response')
         self.assertEqual(review[0]['reason'], 'no_application_found')
 
@@ -244,12 +257,67 @@ class GroupingTests(unittest.TestCase):
         records, _ = self.group([signal('applied', '2026-10-01')])
         self.assertEqual(records[0]['status'], 'applied')
 
-    def test_conflicting_types_become_unknown(self):
+    def test_title_beats_what_the_email_says(self):
+        records, _ = self.group([signal('applied', '2026-02-01', role='Data Analyst', job_type='internship')])
+        self.assertEqual(records[0]['type'], 'full-time')
+
+    def test_email_decides_type_when_there_is_no_role(self):
         records, _ = self.group([
-            signal('applied', '2026-02-01', role='Data Analyst', job_type='internship'),
-            signal('applied', '2026-02-05', role='Data Analyst', job_type='full-time'),
+            signal('applied', '2026-02-01', job_type='internship'),
+            signal('rejected', '2026-02-05'),
+        ])
+        self.assertEqual(records[0]['type'], 'internship')
+
+    def test_conflicting_emails_with_no_role_stay_unknown(self):
+        records, _ = self.group([
+            signal('applied', '2026-02-01', job_type='internship'),
+            signal('applied', '2026-02-01', job_type='full-time'),
         ])
         self.assertEqual(records[0]['type'], 'unknown')
+
+    def test_intern_in_title_is_internship(self):
+        records, _ = self.group([signal('applied', '2026-02-01', role='Data Analyst Intern')])
+        self.assertEqual(records[0]['type'], 'internship')
+
+    def test_named_role_without_intern_is_full_time(self):
+        records, _ = self.group([signal('applied', '2026-02-01', role='Data Analyst')])
+        self.assertEqual(records[0]['type'], 'full-time')
+
+    def test_later_email_supplies_the_role_for_type(self):
+        records, _ = self.group([signal('applied', '2026-02-01'), signal('rejected', '2026-03-01', role='Data Analyst')])
+        self.assertEqual(records[0]['type'], 'full-time')
+
+    def test_no_role_and_nothing_stated_stays_unknown(self):
+        records, _ = self.group([signal('applied', '2026-02-01')])
+        self.assertEqual(records[0]['type'], 'unknown')
+
+    def test_rejection_without_confirmation_counts_once(self):
+        records, review = self.group([signal('rejected', '2026-03-01'), signal('rejected', '2026-03-05')])
+        self.assertEqual(len(records), 1)
+        self.assertIsNone(records[0]['appliedDate'])
+        self.assertEqual(records[0]['lastUpdate'], '2026-03-05')
+        self.assertEqual(records[0]['status'], 'rejected')
+        self.assertEqual(review, [])
+
+    def test_unknown_date_rows_sort_and_keep_separate_ids(self):
+        records, _ = self.group([
+            signal('rejected', '2026-03-01', company='Acme'),
+            signal('rejected', '2026-03-01', company='Globex'),
+            signal('applied', '2026-02-01', company='Initech'),
+        ])
+        self.assertEqual(len({r['id'] for r in records}), 3)
+
+    def test_rejection_for_another_role_is_its_own_application(self):
+        records, review = self.group([
+            signal('applied', '2026-02-01', role='Data Analyst'),
+            signal('rejected', '2026-03-01', role='Sales Manager'),
+        ])
+        self.assertEqual(len(records), 2)
+        self.assertEqual(review, [])
+
+    def test_excluded_company_is_dropped(self):
+        signals = [signal('applied', '2026-02-01', company='Campus'), signal('applied', '2026-02-01', company='Acme')]
+        self.assertEqual([s.company for s in tracker.without_excluded(signals, ['CAMPUS'])], ['Acme'])
 
     def test_missing_company_goes_to_review(self):
         _, review = self.group([signal('applied', '2026-02-01', company=None)])
@@ -259,6 +327,31 @@ class GroupingTests(unittest.TestCase):
         records, review = self.group([signal(None, '2026-02-01', reason='unclear_status')])
         self.assertEqual(records, [])
         self.assertEqual(review[0]['reason'], 'unclear_status')
+
+    def test_company_name_variants_are_one_company(self):
+        records, review = self.group([
+            signal('applied', '2026-02-01', company='Acme', role='Data Analyst'),
+            signal('rejected', '2026-03-01', company='Acme Global'),
+        ])
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]['status'], 'rejected')
+        self.assertEqual(review, [])
+
+    def test_roleless_duplicate_merges_with_other_jobs_at_company(self):
+        records, _ = self.group([
+            signal('applied', '2026-02-01', role='Data Analyst'),
+            signal('applied', '2026-03-01', role='Data Engineer'),
+            signal('applied', '2026-03-01'),
+        ])
+        self.assertEqual(len(records), 2)
+
+    def test_requisition_number_does_not_split_a_role(self):
+        records, _ = self.group([
+            signal('applied', '2026-02-01', role=tracker.clean_role('REQ123456 Data Engineer')),
+            signal('applied', '2026-02-09', role=tracker.clean_role('Data Engineer (Job number: 987654321)')),
+        ])
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]['role'], 'Data Engineer')
 
     def test_id_includes_applied_date(self):
         first, _ = self.group([signal('applied', '2026-02-01', role='Data Analyst')])

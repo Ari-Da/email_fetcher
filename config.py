@@ -75,7 +75,7 @@ TRACKER_ATS_DOMAINS = {
     'rippling.com', 'dover.com', 'teamtailor.com', 'recruitee.com',
     'paylocity.com', 'ultipro.com', 'ukg.com', 'adp.com', 'gem.com',
     'avature.net', 'oraclecloud.com', 'jazzhr.com', 'applytojob.com',
-    'phenompeople.com',
+    'phenompeople.com', 'tal.net',
 }
 TRACKER_JOB_BOARD_DOMAINS = {
     'linkedin.com', 'indeed.com', 'indeedemail.com', 'glassdoor.com',

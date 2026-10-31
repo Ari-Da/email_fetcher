@@ -35,7 +35,7 @@ def get_email_body(payload):
                 return get_email_body(part)
     return ""
 
-# Helper to pull e.g. 'databricks' from 'anne@databricks.com'
+# Helper to pull e.g. 'databricks' from 'name@databricks.com'
 def extract_domain_from_email(email_string):
     try:
         # regex to grab just the email address if it's inside < >
