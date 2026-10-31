@@ -19,15 +19,12 @@ from config import (
     TRACKER_OUTPUT_FILE,
     TRACKER_OVERLAP_DAYS,
     TRACKER_PERSONAL_DOMAINS,
-    TRACKER_REVIEW_MESSAGES_FILE,
     TRACKER_SEARCH_PHRASES,
     TRACKER_START_DATE,
     TRACKER_STATE_FILE,
     TRACKER_TEST_OUTPUT_FILE,
 )
 
-# A confirmation and a duplicate from a job board arrive within this many days
-SAME_APPLICATION_DAYS = 1
 PROGRESS_EVERY = 200
 REJECTION_REASONS = {'no_application_found', 'role_not_matched', 'several_applications_at_company'}
 
@@ -323,6 +320,10 @@ def days_between(first, second):
     return abs((datetime.date.fromisoformat(first) - datetime.date.fromisoformat(second)).days)
 
 
+def email_link(account, message_id):
+    return f"https://mail.google.com/mail/u/{account}/#all/{message_id}"
+
+
 def new_record(signal):
     return {
         'company': signal.company,
@@ -333,29 +334,29 @@ def new_record(signal):
         'firstResponseAt': None,
         'lastUpdateAt': signal.date,
         'accounts': {signal.account},
+        'emailUrl': email_link(signal.account, signal.message_id),
     }
 
 
 def merge_into(record, signal):
-    record['appliedAt'] = min(record['appliedAt'], signal.date)
     record['role'] = record['role'] or signal.role
     record['types'].add(signal.job_type)
     record['accounts'].add(signal.account)
 
 
-# Finds the record a confirmation belongs to. Same company and role is the same
-# application, which is what collapses a job seen in both accounts.
+# Finds the record a confirmation belongs to. A different date always means a
+# different application. On the same date, the same company and role is one
+# application, which collapses a job seen in both accounts.
 def find_applied_record(records, signal):
-    same_company = [r for r in records if company_key(r['company']) == company_key(signal.company)]
-    for record in same_company:
+    same_day = [
+        r for r in records
+        if company_key(r['company']) == company_key(signal.company) and r['appliedAt'] == signal.date
+    ]
+    for record in same_day:
         if record['role'] and signal.role and role_key(record['role']) == role_key(signal.role):
             return record
-    nearby = [
-        r for r in same_company
-        if (not r['role'] or not signal.role)
-        and days_between(r['appliedAt'], signal.date) <= SAME_APPLICATION_DAYS
-    ]
-    return nearby[0] if len(nearby) == 1 else None
+    one_lacks_role = [r for r in same_day if not r['role'] or not signal.role]
+    return one_lacks_role[0] if len(one_lacks_role) == 1 else None
 
 
 # Finds the record a response belongs to, or says why it can't. Never guesses:
@@ -373,9 +374,10 @@ def find_response_record(records, signal):
     if not candidates:
         return None, 'no_application_found'
     if signal.role:
-        for record in candidates:
-            if record['role'] and role_key(record['role']) == role_key(signal.role):
-                return record, None
+        # With repeat applications, a response belongs to the most recent one
+        same_role = [r for r in candidates if r['role'] and role_key(r['role']) == role_key(signal.role)]
+        if same_role:
+            return max(same_role, key=lambda r: r['appliedAt'] or ""), None
         unnamed = [r for r in candidates if not r['role']]
         if len(unnamed) == 1:
             return unnamed[0], None
@@ -417,13 +419,8 @@ def record_id(*parts):
     return 'app-' + hashlib.sha1("|".join(parts).encode()).hexdigest()[:12]
 
 
-# "Account 1" style labels, so the page never holds an email address.
-def account_labels(accounts):
-    return {account: f"Account {number}" for number, account in enumerate(accounts, start=1)}
-
-
-def source_label(accounts, labels):
-    return ", ".join(sorted(labels[account] for account in accounts))
+def source_label(accounts):
+    return ", ".join(sorted(accounts))
 
 
 # The job title decides: a named role without "intern" in it counts as
@@ -435,7 +432,7 @@ def final_type(record):
     return known.pop() if len(known) == 1 else 'unknown'
 
 
-def finish_record(record, today, labels):
+def finish_record(record, today):
     return {
         'id': record_id(company_key(record['company']), role_key(record['role']),
                         record['appliedAt'] or record['firstResponseAt']),
@@ -445,14 +442,15 @@ def finish_record(record, today, labels):
         'type': final_type(record),
         'status': final_status(record, today),
         'lastUpdate': record['lastUpdateAt'],
-        'sourceAccount': source_label(record['accounts'], labels),
+        'sourceAccount': source_label(record['accounts']),
+        'emailUrl': record['emailUrl'],
         'needsReview': False,
     }
 
 
 # A review row uses the same fields as an application, so the page can list it.
 # reviewReason is a fixed category, never text from the email.
-def finish_review(entry, labels):
+def finish_review(entry):
     return {
         'id': record_id(entry['account'], entry['messageId']),
         'company': entry['companyGuess'],
@@ -461,7 +459,8 @@ def finish_review(entry, labels):
         'type': 'unknown',
         'status': entry['statusGuess'] or 'applied',
         'lastUpdate': entry['date'],
-        'sourceAccount': labels[entry['account']],
+        'sourceAccount': entry['account'],
+        'emailUrl': email_link(entry['account'], entry['messageId']),
         'needsReview': True,
         'reviewReason': entry['reason'],
     }
@@ -479,7 +478,7 @@ def unique_ids(finished):
 
 
 # Groups signals into one record per application plus a needs-review list.
-def group_signals(signals, today, labels):
+def group_signals(signals, today):
     records, review = [], []
     ordered = sorted(signals, key=lambda s: s.date)
 
@@ -517,13 +516,14 @@ def group_signals(signals, today, labels):
             review.append(review_entry(signal, reason))
             continue
         record['latestStatus'] = signal.status
+        record['emailUrl'] = email_link(signal.account, signal.message_id)
         record['role'] = record['role'] or signal.role
         record['firstResponseAt'] = record['firstResponseAt'] or signal.date
         record['lastUpdateAt'] = signal.date
         record['types'].add(signal.job_type)
         record['accounts'].add(signal.account)
 
-    finished = [finish_record(record, today, labels) for record in records]
+    finished = [finish_record(record, today) for record in records]
     unique_ids(finished)
     finished.sort(key=lambda r: (r['appliedDate'] or r['lastUpdate'], r['company']), reverse=True)
     review.sort(key=lambda r: r['date'], reverse=True)
@@ -641,10 +641,9 @@ def run(settings, full=False, limit=None):
 
     # Accounts removed from settings drop out of the results
     saved = [Signal(**s) for s in state['signals'] if s['account'] in accounts]
-    labels = account_labels(accounts)
     kept = without_excluded(saved + test_signals, settings.get('excluded_companies', []))
-    applications, review = group_signals(kept, today, labels)
-    review_rows = [finish_review(entry, labels) for entry in review]
+    applications, review = group_signals(kept, today)
+    review_rows = [finish_review(entry) for entry in review]
 
     stats = build_stats(applications, review)
     output_file = TRACKER_TEST_OUTPUT_FILE if limit else TRACKER_OUTPUT_FILE
@@ -652,14 +651,9 @@ def run(settings, full=False, limit=None):
         'generatedAt': today,
         'startDate': TRACKER_START_DATE,
         'noResponseDays': TRACKER_NO_RESPONSE_DAYS,
-        'failedAccounts': [labels[account] for account in failed],
+        'failedAccounts': failed,
         'stats': stats,
         'applications': applications + review_rows,
-    })
-    # Gmail message IDs let her open a review item. This file is never synced.
-    save_private_json(TRACKER_REVIEW_MESSAGES_FILE, {
-        row['id']: {'account': entry['account'], 'messageId': entry['messageId']}
-        for row, entry in zip(review_rows, review)
     })
     print(json.dumps(stats, indent=2))
     print(f"Saved to {output_file}")

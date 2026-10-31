@@ -30,3 +30,6 @@ draft_body.html
 # OS
 .DS_Store
 Thumbs.db
+
+# Local Claude Code files
+.claude/

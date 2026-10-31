@@ -49,7 +49,6 @@ TRACKER_NO_RESPONSE_DAYS = 30
 TRACKER_OUTPUT_FILE = "data/applications.json"
 TRACKER_TEST_OUTPUT_FILE = "data/applications_test.json"
 TRACKER_STATE_FILE = "data/tracker_state.json"
-TRACKER_REVIEW_MESSAGES_FILE = "data/review_messages.json"
 # Each run looks back this far before the last scan, to catch late emails
 TRACKER_OVERLAP_DAYS = 2
 

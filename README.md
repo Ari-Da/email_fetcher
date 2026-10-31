@@ -12,6 +12,7 @@ The project has two features, which run separately and can each use several Gmai
 | File | Purpose |
 |---|---|
 | `run.py` | Starts either feature or both |
+| `sync_prepare.py` | Works out what changed since the last sync to the page |
 | `track_applications.py` | Application tracker |
 | `fetcher.py`, `sender.py` | Recruiter finder: search, then drafts |
 | `gmail_client.py` | Shared read-only Gmail login, search and email reading |
@@ -83,16 +84,17 @@ The tracker finds every application in the listed accounts since the start date.
 |---|---|---|
 | `applications.json` | One row per application, plus flagged needs-review rows | Yes, after review |
 | `tracker_state.json` | How far each account got, and the basic results of each email kept | No |
-| `review_messages.json` | Gmail message IDs for opening needs-review items | No |
 | `applications_test.json` | Results of `--limit` test runs | No |
+| `sync/` | Working files for a sync: the page's rows and the planned changes | Only the listed fields |
 
-All of these are ignored by git. None holds email text, subjects or sender names, and `applications.json` holds no email addresses: accounts appear as `Account 1`, numbered by their order in `settings.json`.
+All of these are ignored by git. None holds email text, subjects or sender names. `applications.json` names the account each application came from and links to one Gmail message, so keep any page it syncs to private. A link only opens for someone signed in to that mailbox.
 
-Each row has `id`, `company`, `role`, `appliedDate`, `type` (`full-time`, `internship` or `unknown`), `status` (`applied`, `rejected`, `assessment`, `interview`, `offer` or `no response`), `lastUpdate`, `sourceAccount` and `needsReview`. Needs-review rows also have `reviewReason`. A row becomes `no response` after 30 days with no reply.
+Each row has `id`, `company`, `role`, `appliedDate`, `type` (`full-time`, `internship` or `unknown`), `status` (`applied`, `rejected`, `assessment`, `interview`, `offer` or `no response`), `lastUpdate`, `sourceAccount`, `emailUrl` and `needsReview`. `emailUrl` opens the email behind the current status: the rejection or assessment if there is one, otherwise the confirmation. Needs-review rows also have `reviewReason`. A row becomes `no response` after 30 days with no reply.
 
 How the tracker decides:
 
-- **Connecting emails**: emails are grouped by company and role, so a confirmation and a later rejection form one application.
+- **Connecting emails**: a confirmation and a later response for the same company and role form one application. With repeat applications, a response goes to the most recent one.
+- **Counting applications**: confirmations with different dates are always separate applications, even for the same company and role. On the same date, the same company and role count once, including across accounts.
 - **Type**: the job title decides. A title mentioning intern is `internship`, and any other title is `full-time`. With no role, the type comes from what the emails say, otherwise it stays `unknown`.
 - **Rejections with no confirmation**: they count as applications, because she can't be rejected without applying. Their `appliedDate` is empty, meaning unknown, so they don't appear in date-based stats. Other responses with no application, such as interview invitations, go to needs review.
 - **Rejections with no role at a company with several applications**: each closes the oldest unanswered application there, and any extra rejections count as new applications with an unknown date. The role may be wrong in these cases, but the rejection totals are right.
@@ -104,6 +106,10 @@ Gmail limits requests per minute, so the tracker reads at a steady pace and wait
 A run with no terminal can't open a browser, so that account is skipped instead of hanging. A login in a terminal gives up after 3 minutes.
 
 To run the tests: `python -m unittest discover -s tests`
+
+## Syncing to a page
+
+Python cannot write to the page directly. `sync_prepare.py` compares `data/applications.json` with a saved copy of the page's rows and plans the changes, and Claude applies them with the ArtifactData tool. Only the fields in `PAGE_FIELDS` are sent. A sync updates changed rows, adds new ones, deletes rows no longer in the results, and never touches any other collection.
 
 ## Features
 

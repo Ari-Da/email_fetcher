@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import gmail_client
 import run as run_module
 import settings as settings_module
+import sync_prepare
 import track_applications as tracker
 from config import GMAIL_READONLY_SCOPES, GMAIL_COMPOSE_SCOPES
 from track_applications import Signal
@@ -23,7 +24,6 @@ from track_applications import Signal
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ACCOUNT_A = "a@example.com"
 ACCOUNT_B = "b@example.com"
-LABELS = {ACCOUNT_A: "Account 1", ACCOUNT_B: "Account 2"}
 TODAY = "2026-10-30"
 
 
@@ -205,16 +205,16 @@ class SlowInputTests(unittest.TestCase):
 
 class GroupingTests(unittest.TestCase):
     def group(self, signals):
-        return tracker.group_signals(signals, TODAY, LABELS)
+        return tracker.group_signals(signals, TODAY)
 
-    def test_same_job_in_both_accounts_counts_once_with_earliest_date(self):
+    def test_same_job_on_one_date_in_both_accounts_counts_once(self):
         records, _ = self.group([
-            signal('applied', '2026-02-03', role='Data Analyst', account=ACCOUNT_B),
+            signal('applied', '2026-02-01', role='Data Analyst', account=ACCOUNT_B),
             signal('applied', '2026-02-01', role='Data Analyst', account=ACCOUNT_A),
         ])
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]['appliedDate'], '2026-02-01')
-        self.assertEqual(records[0]['sourceAccount'], 'Account 1, Account 2')
+        self.assertEqual(records[0]['sourceAccount'], f'{ACCOUNT_A}, {ACCOUNT_B}')
 
     def test_two_roles_at_one_company_stay_separate(self):
         records, _ = self.group([
@@ -287,10 +287,39 @@ class GroupingTests(unittest.TestCase):
         self.assertEqual(records[0]['status'], 'no response')
         self.assertEqual(review[0]['reason'], 'no_application_found')
 
-    def test_board_duplicate_without_role_merges(self):
+    def test_same_role_on_different_dates_are_two_applications(self):
+        for later in ['2026-02-02', '2026-09-01']:
+            records, _ = self.group([
+                signal('applied', '2026-02-01', role='Data Analyst'),
+                signal('applied', later, role='Data Analyst'),
+            ])
+            self.assertEqual(len(records), 2)
+
+    def test_response_goes_to_the_most_recent_repeat_application(self):
         records, _ = self.group([
             signal('applied', '2026-02-01', role='Data Analyst'),
-            signal('applied', '2026-02-02'),
+            signal('applied', '2026-05-01', role='Data Analyst'),
+            signal('rejected', '2026-06-01', role='Data Analyst'),
+        ])
+        statuses = {r['appliedDate']: r['status'] for r in records}
+        self.assertEqual(statuses, {'2026-02-01': 'no response', '2026-05-01': 'rejected'})
+
+    def test_link_opens_the_email_behind_the_status(self):
+        applied = signal('applied', '2026-09-01')
+        rejected = signal('rejected', '2026-09-20', account=ACCOUNT_B)
+        records, _ = self.group([applied])
+        self.assertEqual(records[0]['emailUrl'], tracker.email_link(ACCOUNT_A, applied.message_id))
+        self.assertEqual(records[0]['status'], 'no response')
+        records, _ = self.group([applied, rejected])
+        self.assertEqual(records[0]['emailUrl'], tracker.email_link(ACCOUNT_B, rejected.message_id))
+
+    def test_email_link_names_the_account_and_message(self):
+        self.assertEqual(tracker.email_link(ACCOUNT_A, 'abc'), f'https://mail.google.com/mail/u/{ACCOUNT_A}/#all/abc')
+
+    def test_same_day_duplicate_without_role_merges(self):
+        records, _ = self.group([
+            signal('applied', '2026-02-01', role='Data Analyst'),
+            signal('applied', '2026-02-01'),
         ])
         self.assertEqual(len(records), 1)
 
@@ -393,7 +422,7 @@ class GroupingTests(unittest.TestCase):
     def test_requisition_number_does_not_split_a_role(self):
         records, _ = self.group([
             signal('applied', '2026-02-01', role=tracker.clean_role('REQ123456 Data Engineer')),
-            signal('applied', '2026-02-09', role=tracker.clean_role('Data Engineer (Job number: 987654321)')),
+            signal('applied', '2026-02-01', role=tracker.clean_role('Data Engineer (Job number: 987654321)')),
         ])
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]['role'], 'Data Engineer')
@@ -406,7 +435,7 @@ class GroupingTests(unittest.TestCase):
     def test_record_has_only_the_agreed_fields(self):
         records, _ = self.group([signal('applied', '2026-02-01', role='Data Analyst')])
         self.assertEqual(set(records[0]), {'id', 'company', 'role', 'appliedDate', 'type', 'status',
-                                           'lastUpdate', 'sourceAccount', 'needsReview'})
+                                           'lastUpdate', 'sourceAccount', 'emailUrl', 'needsReview'})
 
     def test_roleless_applications_get_separate_ids(self):
         records, _ = self.group([signal('applied', '2026-02-01'), signal('applied', '2026-05-01')])
@@ -514,10 +543,8 @@ class ResumeTests(unittest.TestCase):
         self.state_file = os.path.join(folder.name, 'state.json')
         self.output_file = os.path.join(folder.name, 'applications.json')
         self.test_file = os.path.join(folder.name, 'test.json')
-        self.review_file = os.path.join(folder.name, 'review.json')
         for name, value in [('TRACKER_STATE_FILE', self.state_file), ('TRACKER_OUTPUT_FILE', self.output_file),
-                            ('TRACKER_TEST_OUTPUT_FILE', self.test_file),
-                            ('TRACKER_REVIEW_MESSAGES_FILE', self.review_file)]:
+                            ('TRACKER_TEST_OUTPUT_FILE', self.test_file)]:
             patcher = mock.patch.object(tracker, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -584,15 +611,15 @@ class ResumeTests(unittest.TestCase):
                 self.assertEqual(failed, [bad])
                 with open(self.output_file) as output:
                     saved = json.load(output)
-                self.assertEqual(saved['failedAccounts'], [LABELS[bad]])
-                self.assertEqual(saved['applications'][0]['sourceAccount'], LABELS[good])
+                self.assertEqual(saved['failedAccounts'], [bad])
+                self.assertEqual(saved['applications'][0]['sourceAccount'], good)
 
     def test_skipped_account_keeps_earlier_results_in_the_output(self):
         self.run_tracker(['1'], accounts=[ACCOUNT_A])
         with self.connect_failing_for(ACCOUNT_A, gmail_client.LoginNeeded("expired")):
             self.run_tracker([], accounts=[ACCOUNT_A, ACCOUNT_B])
         with open(self.output_file) as output:
-            self.assertEqual(json.load(output)['applications'][0]['sourceAccount'], 'Account 1')
+            self.assertEqual(json.load(output)['applications'][0]['sourceAccount'], ACCOUNT_A)
 
     def test_all_accounts_failing_leaves_last_results_alone(self):
         self.run_tracker(['1'])
@@ -628,10 +655,12 @@ class ResumeTests(unittest.TestCase):
         with open(self.output_file) as output:
             self.assertEqual(json.load(output)['applications'], [])
 
-    def test_output_holds_no_email_addresses(self):
+    def test_output_names_the_real_account_but_no_sender(self):
         self.run_tracker(['1'])
         with open(self.output_file) as output:
-            self.assertNotIn("@", output.read())
+            text = output.read()
+        self.assertIn(ACCOUNT_A, text)
+        self.assertNotIn("careers@", text)
 
     def test_review_items_sit_in_the_same_list_flagged(self):
         interview = message("careers@acme.com", "Update", "We would like to invite you to an interview for this role.", message_id='cold')
@@ -643,15 +672,75 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(saved['stats']['applications'], 0)
         self.assertTrue(saved['applications'][0]['needsReview'])
         self.assertEqual(saved['applications'][0]['reviewReason'], 'no_application_found')
-        self.assertNotIn("@", json.dumps(saved))
-        with open(self.review_file) as review:
-            self.assertEqual(list(json.load(review).values())[0]['messageId'], 'cold')
+        self.assertNotIn("careers@", json.dumps(saved))
+        self.assertTrue(saved['applications'][0]['emailUrl'].endswith('/#all/cold'))
 
     def test_state_file_is_private_and_holds_no_email_text(self):
         self.run_tracker(['1'])
         self.assertEqual(os.stat(self.state_file).st_mode & 0o777, 0o600)
         with open(self.state_file) as state_file:
             self.assertNotIn("Thank", state_file.read())
+
+
+class SyncTests(unittest.TestCase):
+    def row(self, **changes):
+        row = {'id': 'app-1', 'company': 'Acme', 'role': None, 'appliedDate': '2026-02-01', 'type': 'unknown',
+               'status': 'applied', 'lastUpdate': '2026-02-01', 'sourceAccount': ACCOUNT_A, 'needsReview': False}
+        row.update(changes)
+        return row
+
+    def saved(self, row, version=3):
+        return {row['id']: (sync_prepare.page_document(row), version)}
+
+    def test_new_row_is_created_without_a_version(self):
+        writes = sync_prepare.build_writes([self.row()], {})
+        self.assertEqual(writes[0]['op'], 'set')
+        self.assertNotIn('if_version', writes[0])
+
+    def test_unchanged_row_writes_nothing(self):
+        self.assertEqual(sync_prepare.build_writes([self.row()], self.saved(self.row())), [])
+
+    def test_changed_row_updates_and_never_duplicates(self):
+        writes = sync_prepare.build_writes([self.row(status='rejected')], self.saved(self.row()))
+        self.assertEqual(len(writes), 1)
+        self.assertEqual((writes[0]['doc_id'], writes[0]['if_version']), ('app-1', 3))
+
+    def test_row_gone_from_results_is_deleted(self):
+        writes = sync_prepare.build_writes([], self.saved(self.row()))
+        self.assertEqual((writes[0]['op'], writes[0]['if_version']), ('delete', 3))
+
+    def test_saved_rows_get_their_tracked_version(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, 'app-1.json'), 'w') as document:
+                json.dump(sync_prepare.page_document(self.row()), document)
+            with open(os.path.join(folder, 'app-2.json'), 'w') as document:
+                json.dump(sync_prepare.page_document(self.row()), document)
+            existing = sync_prepare.load_existing(folder, {'app-1': 4})
+        self.assertEqual((existing['app-1'][1], existing['app-2'][1]), (4, 1))
+
+    def test_versions_follow_an_applied_plan(self):
+        plan = [[{'op': 'set', 'doc_id': 'new'}, {'op': 'set', 'doc_id': 'kept', 'if_version': 2},
+                 {'op': 'delete', 'doc_id': 'gone', 'if_version': 1}]]
+        self.assertEqual(sync_prepare.versions_after(plan, {'gone': 1, 'kept': 2}), {'new': 1, 'kept': 3})
+
+    def test_marking_applied_twice_builds_on_saved_versions(self):
+        with tempfile.TemporaryDirectory() as folder:
+            plan_path, versions_path = os.path.join(folder, 'plan.json'), os.path.join(folder, 'versions.json')
+            with open(plan_path, 'w') as plan_file:
+                json.dump([[{'op': 'set', 'doc_id': 'kept', 'if_version': 1}]], plan_file)
+            sync_prepare.mark_applied(plan_path, versions_path)
+            with open(plan_path, 'w') as plan_file:
+                json.dump([[{'op': 'set', 'doc_id': 'kept', 'if_version': 2}]], plan_file)
+            sync_prepare.mark_applied(plan_path, versions_path)
+            self.assertEqual(sync_prepare.load_versions(versions_path), {'kept': 3})
+
+    def test_only_agreed_fields_reach_the_page(self):
+        document = sync_prepare.page_document(self.row(messageId='secret'))
+        self.assertNotIn('messageId', document)
+        self.assertNotIn('id', document)
+
+    def test_batches_respect_the_limit(self):
+        self.assertEqual([len(b) for b in sync_prepare.batches(list(range(120)))], [50, 50, 20])
 
 
 class FakeList:
