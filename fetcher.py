@@ -1,39 +1,20 @@
 import datetime
-import base64
 import re
 
 from bs4 import BeautifulSoup
 
 import gmail_client
+import recruiter_state
 from settings import load_settings
 
 # Import configuration
 from config import (
-    MAX_RESULTS,
-    DAYS_BACK,
     EMAIL_KEYWORDS,
     JOB_KEYWORDS,
     GENERIC_DOMAINS
 )
 
 #
-
-# Recursively fetches the best text body available.
-def get_email_body(payload):
-    if 'body' in payload and 'data' in payload['body']:
-        return base64.urlsafe_b64decode(payload['body']['data']).decode('utf-8')
-    
-    if 'parts' in payload:
-        for part in payload['parts']:
-            if part['mimeType'] == 'text/plain' and 'data' in part['body']:
-                return base64.urlsafe_b64decode(part['body']['data']).decode('utf-8')
-        for part in payload['parts']:
-            if part['mimeType'] == 'text/html' and 'data' in part['body']:
-                return base64.urlsafe_b64decode(part['body']['data']).decode('utf-8')
-        for part in payload['parts']:
-            if 'parts' in part:
-                return get_email_body(part)
-    return ""
 
 # Helper to pull e.g. 'databricks' from 'name@databricks.com'
 def extract_domain_from_email(email_string):
@@ -113,25 +94,38 @@ def extract_company_from_subject(subject):
             
     return None
 
-# Fetch and return list of email results
-def fetch_emails():
+# Mass emails carry list headers or an unsubscribe link. A person writing to
+# one recipient has neither.
+def is_bulk_email(headers, text):
+    for header in headers:
+        name = header['name'].lower()
+        if name in ('list-unsubscribe', 'list-id'):
+            return True
+        if name == 'precedence' and header['value'].strip().lower() in ('bulk', 'list'):
+            return True
+    return 'unsubscribe' in text.lower()
+
+# Fetch email results, plus the accounts that finished. Reading saves no
+# progress: sender.py does that once the drafts exist.
+def fetch_emails(retry=False, days=None):
+    state = recruiter_state.load_state()
+    today = datetime.date.today()
     email_results = []
+    finished_accounts = []
     for account in load_settings()['recruiter_accounts']:
         print(f"\nAccount: {account}")
         try:
-            email_results.extend(fetch_account_emails(gmail_client.connect(account)))
+            start_date = recruiter_state.scan_start(state, account, today, retry, days)
+            email_results.extend(fetch_account_emails(gmail_client.connect(account), start_date))
+            finished_accounts.append(account)
         except (Exception, SystemExit) as error:
             # One account failing never stops the others
             print(f"{account}: skipped. {error}")
-    return email_results
+    return email_results, finished_accounts
 
 # Runs the recruiter search on one connected account
-def fetch_account_emails(service):
-    # 1. Calculate Date
-    date_limit = datetime.date.today() - datetime.timedelta(days=DAYS_BACK)
-    date_query = date_limit.strftime('%Y/%m/%d')
-
-    # 2. Build Query String (uses standard Gmail search syntax)
+def fetch_account_emails(service, date_query):
+    # 1. Build Query String (uses standard Gmail search syntax)
     # Example result: 'after:2023/10/05 ("job" OR "recruiting")'
     keyword_query = " OR ".join([f'"{k}"' for k in EMAIL_KEYWORDS])
     query_string = (
@@ -142,9 +136,8 @@ def fetch_account_emails(service):
 
     print(f"Searching for emails matching: {query_string}")
 
-    # 3. Fetch Message IDs
-    results = service.users().messages().list(userId="me", q=query_string, maxResults=MAX_RESULTS).execute()
-    messages = results.get("messages", [])
+    # 2. Fetch every Message ID in the window
+    messages = list(gmail_client.search_message_ids(service, query_string))
 
     if not messages:
         print("No messages found.")
@@ -152,10 +145,10 @@ def fetch_account_emails(service):
 
     print(f"Found {len(messages)} messages:\n")
 
-    # 4. Fetch Details for each ID and build result list
+    # 3. Fetch Details for each ID and build result list
     email_results = []
-    for msg in messages:
-        msg_detail = service.users().messages().get(userId="me", id=msg['id'], format='full').execute()
+    for message_id in messages:
+        msg_detail = gmail_client.get_message(service, message_id)
         headers = msg_detail['payload']['headers']
         
         # Extract Metadata
@@ -163,7 +156,7 @@ def fetch_account_emails(service):
         sender = next((h['value'] for h in headers if h['name'] == 'From'), '(Unknown)')
         
         # Extract Body & Clean it (remove HTML tags)
-        raw_body = get_email_body(msg_detail['payload'])
+        raw_body = gmail_client.get_email_body(msg_detail['payload'])
         if not raw_body: continue
         clean_text = BeautifulSoup(raw_body, "html.parser").get_text()
         
@@ -192,7 +185,9 @@ def fetch_account_emails(service):
             'subject': subject,
             'sender': sender,
             'company': company,
-            'position': position
+            'position': position,
+            'bulk': is_bulk_email(headers, clean_text),
+            'text': clean_text
         })
 
         # Output

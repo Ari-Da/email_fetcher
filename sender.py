@@ -1,3 +1,5 @@
+import collections
+import datetime
 import os.path
 import base64
 import re
@@ -15,7 +17,10 @@ from googleapiclient.discovery import build
 # Import from fetcher
 from fetcher import fetch_emails
 import gmail_client
+import recruiter_classifier
+import recruiter_state
 from settings import load_settings
+from track_applications import registered_label
 
 # Import configuration
 from config import (
@@ -24,8 +29,16 @@ from config import (
     TOKEN_SENDER_FILE,
     EMAIL_KEYWORDS,
     JOB_KEYWORDS,
-    LINKEDIN_DOMAINS
+    LINKEDIN_DOMAINS,
+    TRACKER_ATS_DOMAINS,
+    TRACKER_JOB_BOARD_DOMAINS,
+    TRACKER_PERSONAL_DOMAINS
 )
+
+AUTOMATED_MAILBOX = re.compile(r"^(?:no-?reply|do-?not-?reply|notifications?|mailer-daemon|postmaster|alerts?|updates?)\b", re.I)
+# Messages about a process already under way, which outreach would interrupt
+ACTIVE_PROCESS_SUBJECT = re.compile(
+    r"\b(?:interview\w*|recruiter screen|phone screen|confirmation|confirmed|scheduled?|reschedul\w+|assessment|your application)\b", re.I)
 
 # Extract email address from sender string like 'Name <email@domain.com>' or 'email@domain.com'
 def extract_email_address(sender_string):
@@ -40,6 +53,47 @@ def extract_email_address(sender_string):
         return match.group(0)
     
     return None
+
+# Returns why an email isn't real outreach to answer, or None if it is.
+def filter_reason(to_email, subject, bulk):
+    mailbox, _, domain = to_email.lower().partition('@')
+    if AUTOMATED_MAILBOX.match(mailbox):
+        return 'automated address'
+    third_party = TRACKER_ATS_DOMAINS | TRACKER_JOB_BOARD_DOMAINS
+    if any(domain == known or domain.endswith('.' + known) for known in third_party):
+        return 'hiring system'
+    if domain.endswith('.edu') or '.edu.' in domain:
+        return 'university'
+    if ACTIVE_PROCESS_SUBJECT.search(subject):
+        return 'active process'
+    if bulk:
+        return 'mass email'
+    return None
+
+def email_domain(address):
+    return address.lower().partition('@')[2]
+
+# Companies with an interview under way. Everyone there is off limits, not just
+# the person who sent the scheduling email. Gmail and similar services are not
+# companies, so they never block anyone.
+def active_process_companies(email_results):
+    companies = set()
+    for email_result in email_results:
+        address = extract_email_address(email_result['sender'])
+        if not address or not ACTIVE_PROCESS_SUBJECT.search(email_result['subject']):
+            continue
+        domain = email_domain(address)
+        if not any(domain == known or domain.endswith('.' + known) for known in TRACKER_PERSONAL_DOMAINS):
+            companies.add(registered_label(domain))
+    return companies
+
+# True if she already has a draft or sent email to this address. A retry
+# ignores the saved list, so a deleted draft can be made again.
+def already_contacted(read_service, to_email, state, retry=False):
+    if not retry and recruiter_state.address_hash(to_email) in state['contacted']:
+        return True
+    query = f'to:"{to_email}" (in:sent OR in:drafts)'
+    return next(gmail_client.search_message_ids(read_service, query), None) is not None
 
 # Check if sender is from LinkedIn
 def is_linkedin_sender(sender_string):
@@ -105,18 +159,18 @@ def create_draft_message(service, to_email, subject, body, from_email=None, atta
     
     return draft
 
-def main():
+def main(retry=False, days=None):
     settings = load_settings()
     destination_email = settings['destination_email']
     with open(settings['draft_body_file']) as body_file:
         draft_body = body_file.read()
 
+    # No draft is made without the model's check, so stop early if it's missing
+    recruiter_classifier.require_model()
+
     # Get email results from fetcher
-    email_results = fetch_emails()
-    
-    if not email_results:
-        print("No email results to process.")
-        return
+    email_results, finished_accounts = fetch_emails(retry, days)
+    state = recruiter_state.load_state()
     
     # Authenticate with compose scope for creating drafts
     creds = None
@@ -160,10 +214,17 @@ def main():
         return
     print(f"Drafts will be created in: {authenticated_email}\n")
     
+    # Draft access can't search mail, so the check for past contact reads separately
+    read_service = gmail_client.connect(destination_email)
+    
     # Process each email result
     drafts_created = 0
     skipped = 0
     drafted_for = set()
+    skip_reasons = collections.Counter()
+    # Replies sent from her own accounts or the searched ones are never recruiters
+    own_addresses = {a.lower() for a in settings['recruiter_accounts'] + [destination_email]}
+    active_companies = active_process_companies(email_results)
     
     print("\n\nProcessing results for draft creation:\n")
     print("-" * 40)
@@ -174,28 +235,58 @@ def main():
         
         # Filter: Skip LinkedIn senders
         if is_linkedin_sender(sender):
-            # print(f"Skipping LinkedIn sender: {sender}")
+            skip_reasons['linkedin'] += 1
             skipped += 1
             continue
         
         # Filter: Check if subject contains keywords
         if not subject_contains_keywords(subject):
-            # print(f"Skipping - subject doesn't contain keywords: {subject}")
+            skip_reasons['no job words in subject'] += 1
             skipped += 1
             continue
         
         # Extract email address from sender
         to_email = extract_email_address(sender)
         if not to_email:
-            # print(f"Skipping - could not extract email from: {sender}")
+            skip_reasons['no sender address'] += 1
+            skipped += 1
+            continue
+        if to_email.lower() in own_addresses:
+            skip_reasons['own email'] += 1
+            skipped += 1
+            continue
+        
+        # Filter: Skip automated, university, in-progress and mass emails
+        reason = filter_reason(to_email, subject, email_result['bulk'])
+        if not reason and registered_label(email_domain(to_email)) in active_companies:
+            reason = 'active process'
+        if reason:
+            skip_reasons[reason] += 1
             skipped += 1
             continue
         
         # One draft per recruiter, even if they emailed several accounts
         if to_email.lower() in drafted_for:
+            skip_reasons['same recruiter again'] += 1
             skipped += 1
             continue
         drafted_for.add(to_email.lower())
+        
+        # Skip anyone she already contacted
+        if not re.fullmatch(r'[\w.+-]+@[\w.-]+', to_email):
+            skip_reasons['invalid address'] += 1
+            skipped += 1
+            continue
+        if already_contacted(read_service, to_email, state, retry):
+            skip_reasons['already contacted'] += 1
+            skipped += 1
+            continue
+        
+        # The rules are a first pass. The model reads the email for context
+        if not recruiter_classifier.is_cold_outreach(sender, subject, email_result['text']):
+            skip_reasons['not cold outreach'] += 1
+            skipped += 1
+            continue
         
         # Create draft
         try:
@@ -205,13 +296,22 @@ def main():
             print(f"  From: {destination_email}")
             print(f"  Original subject: {subject}")
             drafts_created += 1
+            # Saved per draft, so a crash can't lead to a duplicate
+            state['contacted'].append(recruiter_state.address_hash(to_email))
+            recruiter_state.save_state(state)
         except Exception as e:
             print(f"Error creating draft for {to_email}: {str(e)}")
             skipped += 1
         
         print("-" * 40)
     
+    # Progress only moves forward once every result has been handled
+    for account in finished_accounts:
+        state['scannedThrough'][account] = datetime.date.today().isoformat()
+    recruiter_state.save_state(state)
     print(f"\nSummary: {drafts_created} drafts created, {skipped} skipped")
+    for reason, count in skip_reasons.most_common():
+        print(f"  {reason}: {count}")
 
 if __name__ == "__main__":
     main()

@@ -16,5 +16,6 @@
   "attachment_file": "",
   "excluded_companies": [
     "Company To Ignore"
-  ]
+  ],
+  "recruiter_subject_history": []
 }

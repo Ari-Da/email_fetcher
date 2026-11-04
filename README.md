@@ -12,6 +12,7 @@ The project has two features, which run separately and can each use several Gmai
 | File | Purpose |
 |---|---|
 | `run.py` | Starts either feature or both |
+| `recruiter_stats.py` | Read-only stats on emails sent to recruiters and the replies |
 | `sync_prepare.py` | Works out what changed since the last sync to the page |
 | `track_applications.py` | Application tracker |
 | `fetcher.py`, `sender.py` | Recruiter finder: search, then drafts |
@@ -63,6 +64,8 @@ Copy `settings.example.json` to `settings.json` and fill it in. Put the draft te
 - `application_accounts`: inboxes the application tracker searches
 - `destination_email`: the one account that holds the drafts
 - `excluded_companies`: employers the tracker leaves out, with no rescan needed
+- `recruiter_subject_history`: older draft subjects to include in recruiter stats
+- `attachment_file`: optional file to attach to drafts. Leave it empty for no attachment
 
 Add every address as a **Test User** (see step 2 above).
 
@@ -73,8 +76,15 @@ python run.py              # whatever is switched on in settings.json
 python run.py tracker      # application tracker only
 python run.py recruiter    # recruiter finder and drafts only
 python run.py all          # both
-python fetcher.py          # recruiter results only, no drafts
+python run.py outreach     # recruiter email stats only
+python fetcher.py          # recruiter results only, no drafts or saved progress
 ```
+
+Drafts are only made for emails that look like a person reaching out, never for emails sent from her own or the searched accounts. Automated addresses, hiring systems, job boards, `.edu` senders, active process emails such as interview confirmations (plus everyone else at that company, though Gmail and similar services never count as a company), and mass emails with an unsubscribe link or list headers are skipped.
+
+Emails that pass those rules are then checked by a small local AI model, which reads the email and decides if it is cold outreach. It runs through [Ollama](https://ollama.com) on this computer, so email text never leaves it. Install Ollama, run `ollama pull llama3.2:3b`, and keep the app open. Without it, `run.py recruiter` stops before making any drafts. `python fetcher.py` skips this check.
+
+The first recruiter run searches the past 30 days. Later runs continue from the last finished run, with 2 days of overlap. Every matching email in that window is read. Recruiters who already have a draft or sent email in `destination_email`, or a draft made by this tool, are skipped, so each recruiter is contacted once. Progress is kept in `data/recruiter_state.json`, which is ignored by git and holds addresses as hashes. If you delete a draft and want it back, run `python run.py recruiter --retry`. To search further back once, add `--days 90`; recruiters already contacted are still skipped.
 
 Tracker options: `--limit 50` tests on a few emails without saving progress, and `--full` rescans from the start date.
 
@@ -89,7 +99,7 @@ The tracker finds every application in the listed accounts since the start date.
 
 All of these are ignored by git. None holds email text, subjects or sender names. `applications.json` names the account each application came from and links to one Gmail message, so keep any page it syncs to private. A link only opens for someone signed in to that mailbox.
 
-Each row has `id`, `company`, `role`, `appliedDate`, `type` (`full-time`, `internship` or `unknown`), `status` (`applied`, `rejected`, `assessment`, `interview`, `offer` or `no response`), `lastUpdate`, `sourceAccount`, `emailUrl` and `needsReview`. `emailUrl` opens the email behind the current status: the rejection or assessment if there is one, otherwise the confirmation. Needs-review rows also have `reviewReason`. A row becomes `no response` after 30 days with no reply.
+Each row has `id`, `company`, `role`, `appliedDate`, `type` (`full-time`, `internship` or `unknown`), `status` (`applied`, `rejected`, `assessment`, `interview`, `offer` or `no response`), `lastUpdate`, `sourceAccount`, `emailUrl`, `needsReview`, `origin` (`email` or `skill`) and `jobsId` (the Job Search row a skill row came from). `emailUrl` opens the email behind the current status: the rejection or assessment if there is one, otherwise the confirmation. Needs-review rows also have `reviewReason`. A row becomes `no response` after 30 days with no reply.
 
 How the tracker decides:
 
@@ -107,9 +117,25 @@ A run with no terminal can't open a browser, so that account is skipped instead 
 
 To run the tests: `python -m unittest discover -s tests`
 
+## Recruiter outreach stats
+
+`python run.py outreach` checks the Sent mail of `destination_email` for emails with `draft_subject`, plus any older subjects in `recruiter_subject_history`. It only reads message headers, never email text.
+
+A thread counts as `replied` when a person writes back. Out-of-office and other automatic replies don't count, and undelivered emails show as `bounced`. Drafts don't count until they are sent. Results go to `data/recruiter_outreach.json`, which is ignored by git. Each row has `company`, `sentDate`, `status`, `replyDate` and `emailUrl`, with no recruiter names or addresses. The company comes from the recipient's email domain.
+
 ## Syncing to a page
 
-Python cannot write to the page directly. `sync_prepare.py` compares `data/applications.json` with a saved copy of the page's rows and plans the changes, and Claude applies them with the ArtifactData tool. Only the fields in `PAGE_FIELDS` are sent. A sync updates changed rows, adds new ones, deletes rows no longer in the results, and never touches any other collection.
+Python cannot write to the page directly. `sync_prepare.py` compares the results with a local copy of the page's rows in `data/sync/mirror/` and plans the changes (add `outreach` for recruiter stats), and Claude applies them with the ArtifactData tool. Only the fields in `PAGE_FIELDS` are sent. For the application history (`email_applications`) a sync merges and never deletes:
+
+- Rows the apply skill wrote when she submitted (`origin: skill`) are kept. When their confirmation email arrives, the sync fills in the email link and account, and moves the status forward. The skill's company, role and date stay as they are.
+- A tracker row matches a skill row when the company is the same (subsidiaries count), the role is similar, and the dates are within 5 days. Several or weak matches are added for review instead of guessed.
+- Email only moves a status forward, so a later stage is never undone.
+- An email row the latest scan no longer has is flagged for review, which takes it out of the totals. Rows are only removed by hand.
+- A skill row with no email after 30 days becomes `no response`.
+
+The local copy only changes through these writes: `python sync_prepare.py --applied` records each applied plan, and the apply skill saves its rows there too. Every write carries the row's version, so a row changed by hand on the page is refused rather than overwritten. Start the copy once with `python sync_prepare.py --seed`, from results already synced to the page.
+
+Recruiter outreach (`recruiter_outreach`) still mirrors the results, deleting rows no longer in them. A sync never touches any other collection.
 
 ## Features
 

@@ -15,6 +15,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import gmail_client
 import run as run_module
+import fetcher
+import recruiter_classifier
+import recruiter_state
+import recruiter_stats
+import sender
 import settings as settings_module
 import sync_prepare
 import track_applications as tracker
@@ -700,6 +705,367 @@ class ResumeTests(unittest.TestCase):
             self.assertNotIn("Thank", state_file.read())
 
 
+def thread_message(message_id, sender, when, subject="Hello there", to="sam@acme.com", auto=None):
+    headers = [{'name': 'From', 'value': sender}, {'name': 'To', 'value': to}, {'name': 'Subject', 'value': subject}]
+    if auto:
+        headers.append({'name': 'Auto-Submitted', 'value': auto})
+    return {'id': message_id, 'internalDate': str(when), 'payload': {'headers': headers}}
+
+
+class OutreachTests(unittest.TestCase):
+    SUBJECTS = ["Hello there"]
+
+    def summary(self, *messages):
+        return recruiter_stats.summarize_thread({'id': 't1', 'messages': list(messages)}, ACCOUNT_A, self.SUBJECTS)
+
+    def sent(self, **options):
+        return thread_message('sent', f"Me <{ACCOUNT_A}>", 1760000000000, **options)
+
+    def test_sent_with_no_reply(self):
+        row = self.summary(self.sent())
+        self.assertEqual((row['status'], row['replyDate'], row['company']), ('no reply', None, 'Acme'))
+
+    def test_recruiter_reply_counts_and_link_opens_it(self):
+        row = self.summary(self.sent(), thread_message('reply', "Sam <sam@acme.com>", 1760100000000, "Re: Hello there"))
+        self.assertEqual(row['status'], 'replied')
+        self.assertTrue(row['replyDate'])
+        self.assertTrue(row['emailUrl'].endswith('#all/reply'))
+
+    def test_out_of_office_is_not_a_reply(self):
+        for reply in [thread_message('r', "Sam <sam@acme.com>", 1760100000000, "Automatic reply: Hello there"),
+                      thread_message('r', "Sam <sam@acme.com>", 1760100000000, "Re: Hello there", auto="auto-replied"),
+                      thread_message('r', "no-reply@acme.com", 1760100000000, "Re: Hello there")]:
+            self.assertEqual(self.summary(self.sent(), reply)['status'], 'no reply')
+
+    def test_bounce_is_separate_from_a_reply(self):
+        row = self.summary(self.sent(), thread_message('b', "mailer-daemon@googlemail.com", 1760100000000, "Delivery Status Notification"))
+        self.assertEqual(row['status'], 'bounced')
+
+    def test_real_reply_beats_an_earlier_auto_reply(self):
+        row = self.summary(self.sent(),
+                           thread_message('a', "Sam <sam@acme.com>", 1760100000000, "Automatic reply: Hello there"),
+                           thread_message('r', "Sam <sam@acme.com>", 1760200000000, "Re: Hello there"))
+        self.assertEqual(row['status'], 'replied')
+
+    def test_her_own_follow_up_is_not_a_reply(self):
+        row = self.summary(self.sent(), thread_message('f', ACCOUNT_A, 1760100000000, "Re: Hello there"))
+        self.assertEqual(row['status'], 'no reply')
+
+    def test_other_subjects_are_ignored(self):
+        self.assertIsNone(self.summary(thread_message('x', ACCOUNT_A, 1760000000000, "Something else")))
+
+    def test_row_holds_no_recruiter_details(self):
+        row = self.summary(self.sent(), thread_message('r', "Sam Lee <sam@acme.com>", 1760100000000, "Re: Hello there"))
+        self.assertNotIn("Sam", json.dumps(row))
+        self.assertNotIn("sam@", json.dumps(row))
+        self.assertEqual(set(row), {'id', 'company', 'sentDate', 'status', 'replyDate', 'emailUrl'})
+
+    def test_personal_recipient_has_no_company(self):
+        self.assertIsNone(self.summary(self.sent(to="sam@gmail.com"))['company'])
+
+    def test_stats(self):
+        rows = [{'status': 'replied'}, {'status': 'no reply'}, {'status': 'no reply'}, {'status': 'bounced'}]
+        self.assertEqual(recruiter_stats.build_stats(rows), {'sent': 4, 'replied': 1, 'bounced': 1, 'noReply': 2})
+
+    def test_query_only_searches_sent_mail(self):
+        self.assertEqual(recruiter_stats.build_query(["A", "B"]), 'in:sent (subject:"A" OR subject:"B")')
+
+    def test_outreach_sync_keeps_to_its_own_fields(self):
+        row = {'id': 'x', 'company': 'Acme', 'sentDate': '2026-01-01', 'status': 'replied', 'replyDate': None, 'emailUrl': 'u', 'extra': 'no'}
+        fields = sync_prepare.TARGETS['outreach']['fields']
+        self.assertNotIn('extra', sync_prepare.build_writes([row], {}, fields)[0]['data'])
+
+
+class RecruiterMemoryTests(unittest.TestCase):
+    TODAY = datetime.date(2026, 10, 30)
+
+    def test_first_run_goes_back_thirty_days(self):
+        state = {'scannedThrough': {}, 'contacted': []}
+        self.assertEqual(recruiter_state.scan_start(state, ACCOUNT_A, self.TODAY), '2026/09/30')
+
+    def test_later_run_continues_with_overlap(self):
+        state = {'scannedThrough': {ACCOUNT_A: '2026-10-20'}, 'contacted': []}
+        self.assertEqual(recruiter_state.scan_start(state, ACCOUNT_A, self.TODAY), '2026/10/18')
+
+    def test_retry_uses_the_full_window(self):
+        state = {'scannedThrough': {ACCOUNT_A: '2026-10-20'}, 'contacted': []}
+        self.assertEqual(recruiter_state.scan_start(state, ACCOUNT_A, self.TODAY, retry=True), '2026/09/30')
+
+    def test_days_option_searches_further_back(self):
+        state = {'scannedThrough': {ACCOUNT_A: '2026-10-20'}, 'contacted': []}
+        self.assertEqual(recruiter_state.scan_start(state, ACCOUNT_A, self.TODAY, days=90), '2026/08/01')
+
+    def test_new_account_starts_with_the_window(self):
+        state = {'scannedThrough': {ACCOUNT_A: '2026-10-20'}, 'contacted': []}
+        self.assertEqual(recruiter_state.scan_start(state, ACCOUNT_B, self.TODAY), '2026/09/30')
+
+    def test_hash_ignores_case_and_hides_the_address(self):
+        self.assertEqual(recruiter_state.address_hash("Sam@Acme.com "), recruiter_state.address_hash("sam@acme.com"))
+        self.assertNotIn("acme", recruiter_state.address_hash("sam@acme.com"))
+
+    def test_state_file_is_private(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, 'state.json')
+            recruiter_state.save_state({'scannedThrough': {}, 'contacted': ['x']}, path)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            self.assertEqual(recruiter_state.load_state(path)['contacted'], ['x'])
+
+    def contacted(self, found, state=None, retry=False):
+        state = state or {'contacted': []}
+        with mock.patch.object(gmail_client, 'search_message_ids', lambda service, query: iter(found)):
+            return sender.already_contacted(object(), "sam@acme.com", state, retry)
+
+    def test_saved_recruiter_is_skipped_without_searching(self):
+        state = {'contacted': [recruiter_state.address_hash("sam@acme.com")]}
+        with mock.patch.object(gmail_client, 'search_message_ids', side_effect=AssertionError):
+            self.assertTrue(sender.already_contacted(object(), "sam@acme.com", state))
+
+    def test_gmail_history_is_skipped(self):
+        self.assertTrue(self.contacted(['1']))
+
+    def test_new_recruiter_is_kept(self):
+        self.assertFalse(self.contacted([]))
+
+    def test_retry_redoes_a_deleted_draft(self):
+        state = {'contacted': [recruiter_state.address_hash("sam@acme.com")]}
+        self.assertFalse(self.contacted([], state, retry=True))
+
+    def test_retry_still_respects_sent_mail(self):
+        state = {'contacted': [recruiter_state.address_hash("sam@acme.com")]}
+        self.assertTrue(self.contacted(['1'], state, retry=True))
+
+    def test_search_checks_sent_and_drafts(self):
+        queries = []
+        with mock.patch.object(gmail_client, 'search_message_ids', lambda s, q: queries.append(q) or iter([])):
+            sender.already_contacted(object(), "sam@acme.com", {'contacted': []})
+        self.assertEqual(queries, ['to:"sam@acme.com" (in:sent OR in:drafts)'])
+
+
+class RecruiterFilterTests(unittest.TestCase):
+    def reason(self, to_email="sam@acme.com", subject="Opportunity at Acme", bulk=False):
+        return sender.filter_reason(to_email, subject, bulk)
+
+    def test_person_reaching_out_passes(self):
+        self.assertIsNone(self.reason())
+        self.assertIsNone(self.reason(subject="Re: Opportunity with Acme"))
+
+    def test_automated_addresses_are_skipped(self):
+        for address in ["no-reply@acme.com", "noreply@acme.com", "do-not-reply@acme.com", "notifications@acme.com"]:
+            self.assertEqual(self.reason(address), 'automated address', address)
+
+    def test_hiring_systems_and_boards_are_skipped(self):
+        for address in ["team@us.greenhouse-jobs.com", "sam@hire.lever.co", "sam@ashbyhq.com", "sam@ripplematch.com"]:
+            self.assertEqual(self.reason(address), 'hiring system', address)
+
+    def test_universities_are_skipped(self):
+        self.assertEqual(self.reason("sam@alumni.example.edu"), 'university')
+
+    def test_active_process_subjects_are_skipped(self):
+        for subject in ["Acme Recruiter Screen Confirmation", "Your interview with Acme", "Assessment for your role"]:
+            self.assertEqual(self.reason(subject=subject), 'active process', subject)
+
+    def test_mass_emails_are_skipped(self):
+        self.assertEqual(self.reason(bulk=True), 'mass email')
+
+    def test_interview_blocks_the_whole_company(self):
+        results = [{'sender': "Pat <pat@acme.com>", 'subject': "Schedule your interview with Acme"},
+                   {'sender': "Sam <sam@ext.acme.com>", 'subject': "A note from your recruiting team"},
+                   {'sender': "Kim <kim@globex.com>", 'subject': "Opportunity at Globex"}]
+        companies = sender.active_process_companies(results)
+        self.assertEqual(companies, {'acme'})
+        self.assertIn(tracker.registered_label(sender.email_domain("sam@ext.acme.com")), companies)
+        self.assertNotIn(tracker.registered_label(sender.email_domain("kim@globex.com")), companies)
+
+    def test_personal_email_services_never_block_a_company(self):
+        results = [{'sender': "Nick <nick@gmail.com>", 'subject': "Re: Acme Recruiter Screen Confirmation"},
+                   {'sender': "Pat <pat@acme.com>", 'subject': "Your interview with Acme"}]
+        self.assertEqual(sender.active_process_companies(results), {'acme'})
+
+    def test_bulk_detection(self):
+        self.assertTrue(fetcher.is_bulk_email([{'name': 'List-Unsubscribe', 'value': '<x>'}], "Hello"))
+        self.assertTrue(fetcher.is_bulk_email([{'name': 'Precedence', 'value': 'bulk'}], "Hello"))
+        self.assertTrue(fetcher.is_bulk_email([], "Click to unsubscribe."))
+        self.assertFalse(fetcher.is_bulk_email([{'name': 'Subject', 'value': 'Hi'}], "Hello there"))
+
+
+class RecruiterClassifierTests(unittest.TestCase):
+    def answer(self, response):
+        with mock.patch.object(recruiter_classifier, 'request_json', return_value={'response': response}):
+            return recruiter_classifier.is_cold_outreach("sam@acme.com", "Hello", "Body")
+
+    def test_clear_yes(self):
+        self.assertTrue(self.answer('{"category": "recruiter_outreach"}'))
+
+    def test_no_and_unclear_answers_never_draft(self):
+        for response in ['{"category": "interview_process"}', '{"category": "other"}', '{"category": true}', 'not json', '', '[]']:
+            self.assertFalse(self.answer(response), response)
+
+    def test_only_a_local_address_is_used(self):
+        self.assertTrue(recruiter_classifier.OLLAMA_URL.startswith('http://localhost:'))
+
+    def test_long_email_is_cut_before_the_model(self):
+        sent = {}
+        def capture(path, payload):
+            sent.update(payload)
+            return {'response': '{"category": "other"}'}
+        with mock.patch.object(recruiter_classifier, 'request_json', capture):
+            recruiter_classifier.is_cold_outreach("s", "t", "x" * 50000)
+        self.assertLess(len(sent['prompt']), 5000)
+        self.assertEqual(sent['options']['temperature'], 0)
+
+    def test_missing_model_stops_the_run(self):
+        with mock.patch.object(recruiter_classifier, 'request_json', return_value={'models': []}):
+            with self.assertRaises(recruiter_classifier.ModelUnavailable):
+                recruiter_classifier.require_model()
+
+    def test_unreachable_ollama_is_a_clear_error(self):
+        with mock.patch('urllib.request.urlopen', side_effect=recruiter_classifier.urllib.error.URLError('down')):
+            with self.assertRaises(recruiter_classifier.ModelUnavailable):
+                recruiter_classifier.require_model()
+
+
+class RecruiterFetchTests(unittest.TestCase):
+    def fetched(self, ids, messages):
+        with mock.patch.object(gmail_client, 'search_message_ids', lambda s, q: iter(ids)), \
+                mock.patch.object(gmail_client, 'get_message', lambda s, i: messages[i]):
+            return fetcher.fetch_account_emails(object(), '2026/09/30')
+
+    def test_reads_every_result_past_the_old_limit(self):
+        ids = [str(i) for i in range(60)]
+        messages = {i: message("sam@acme.com", "Hiring", "A job for you.") for i in ids}
+        self.assertEqual(len(self.fetched(ids, messages)), 60)
+
+    def test_badly_encoded_email_does_not_crash(self):
+        bad = message("sam@acme.com", "Hiring", "x")
+        bad['payload']['body']['data'] = base64.urlsafe_b64encode(b"caf\xe9 job").decode()
+        self.assertEqual(len(self.fetched(['1'], {'1': bad})), 1)
+
+    def test_query_uses_the_given_start_date(self):
+        queries = []
+        with mock.patch.object(gmail_client, 'search_message_ids', lambda s, q: queries.append(q) or iter([])):
+            fetcher.fetch_account_emails(object(), '2026/09/30')
+        self.assertIn('after:2026/09/30', queries[0])
+
+    def test_failed_account_is_not_marked_finished(self):
+        def connect(account):
+            if account == ACCOUNT_A:
+                raise gmail_client.LoginNeeded("expired")
+            return object()
+        with mock.patch.object(gmail_client, 'connect', connect), \
+                mock.patch.object(gmail_client, 'search_message_ids', lambda s, q: iter([])), \
+                mock.patch.object(fetcher, 'load_settings', return_value={'recruiter_accounts': [ACCOUNT_A, ACCOUNT_B]}), \
+                mock.patch.object(recruiter_state, 'load_state', return_value={'scannedThrough': {}, 'contacted': []}):
+            _, finished = fetcher.fetch_emails()
+        self.assertEqual(finished, [ACCOUNT_B])
+
+
+class MergeTests(unittest.TestCase):
+    TODAY = '2026-11-04'
+
+    def email(self, **changes):
+        row = {'id': 'app-1', 'company': 'Acme', 'role': 'Data Analyst', 'appliedDate': '2026-11-01', 'type': 'full-time',
+               'status': 'applied', 'lastUpdate': '2026-11-01', 'sourceAccount': ACCOUNT_A, 'emailUrl': 'link-1',
+               'needsReview': False, 'reviewReason': None}
+        row.update(changes)
+        return row
+
+    def skill(self, doc_id='skill-r1101-01-acme', version=1, **changes):
+        row = {'company': 'Acme (Tier 1)', 'role': 'Data Analyst, New Grad', 'appliedDate': '2026-11-01', 'type': 'full-time',
+               'status': 'applied', 'lastUpdate': '2026-11-01', 'sourceAccount': None, 'emailUrl': None,
+               'needsReview': False, 'reviewReason': None, 'origin': 'skill', 'jobsId': 'r1101-01-acme'}
+        row.update(changes)
+        return {doc_id: (row, version)}
+
+    def merge(self, rows, existing):
+        return sync_prepare.merge_writes(rows, existing, self.TODAY)
+
+    def test_confirmation_fills_the_skill_row(self):
+        writes = self.merge([self.email()], self.skill())
+        self.assertEqual(len(writes), 1)
+        data = writes[0]['data']
+        self.assertEqual((writes[0]['doc_id'], writes[0]['if_version']), ('skill-r1101-01-acme', 1))
+        self.assertEqual((data['emailUrl'], data['sourceAccount'], data['origin'], data['jobsId']), ('link-1', ACCOUNT_A, 'skill', 'r1101-01-acme'))
+        self.assertEqual((data['role'], data['company']), ('Data Analyst, New Grad', 'Acme (Tier 1)'))
+
+    def test_rejection_moves_the_skill_row_forward(self):
+        writes = self.merge([self.email(status='rejected', lastUpdate='2026-11-03')], self.skill())
+        self.assertEqual((writes[0]['data']['status'], writes[0]['data']['lastUpdate']), ('rejected', '2026-11-03'))
+
+    def test_status_never_moves_back(self):
+        writes = self.merge([self.email(status='applied')], self.skill(status='interview'))
+        self.assertEqual(writes[0]['data']['status'], 'interview')
+        email_on_page = {'app-1': (dict(sync_prepare.email_document(self.email()), status='rejected'), 2)}
+        self.assertEqual(self.merge([self.email(status='applied')], email_on_page), [])
+
+    def test_subsidiary_counts_as_the_same_company(self):
+        skill = self.skill(company='Acme Cloud Services', role='Platform Engineer')
+        writes = self.merge([self.email(company='Acme', role='Platform Engineer I')], skill)
+        self.assertEqual(writes[0]['doc_id'], 'skill-r1101-01-acme')
+
+    def test_email_with_no_role_matches_one_skill_row(self):
+        writes = self.merge([self.email(role=None)], self.skill())
+        self.assertEqual(writes[0]['doc_id'], 'skill-r1101-01-acme')
+
+    def test_outside_the_date_window_is_a_new_application(self):
+        writes = self.merge([self.email(appliedDate='2026-11-20')], self.skill())
+        self.assertEqual([w['doc_id'] for w in writes], ['app-1'])
+        self.assertEqual(writes[0]['data']['origin'], 'email')
+        self.assertFalse(writes[0]['data']['needsReview'])
+
+    def test_no_match_adds_an_email_row(self):
+        writes = self.merge([self.email(company='Globex')], self.skill())
+        self.assertEqual([w['doc_id'] for w in writes], ['app-1'])
+
+    def test_different_role_same_company_goes_to_review(self):
+        writes = self.merge([self.email(role='Sales Manager')], self.skill())
+        self.assertEqual([w['doc_id'] for w in writes], ['app-1'])
+        self.assertEqual((writes[0]['data']['needsReview'], writes[0]['data']['reviewReason']), (True, 'possible_duplicate'))
+
+    def test_two_possible_skill_rows_go_to_review(self):
+        existing = {**self.skill('skill-a'), **self.skill('skill-b', jobsId='r1101-02-acme')}
+        writes = self.merge([self.email(role=None)], existing)
+        self.assertEqual(writes[0]['data']['reviewReason'], 'possible_duplicate')
+
+    def test_each_skill_row_takes_one_email(self):
+        rows = [self.email(), self.email(id='app-2', emailUrl='link-2')]
+        writes = self.merge(rows, self.skill())
+        self.assertEqual(sorted(w['doc_id'] for w in writes), ['app-2', 'skill-r1101-01-acme'])
+
+    def test_rejection_without_a_date_matches_an_earlier_skill_row(self):
+        writes = self.merge([self.email(appliedDate=None, status='rejected', lastUpdate='2026-11-03')], self.skill())
+        self.assertEqual(writes[0]['doc_id'], 'skill-r1101-01-acme')
+
+    def test_nothing_is_ever_deleted(self):
+        email_on_page = {'app-9': (sync_prepare.email_document(self.email(id='app-9')), 3)}
+        writes = self.merge([], {**email_on_page, **self.skill()})
+        self.assertNotIn('delete', [w['op'] for w in writes])
+
+    def test_email_row_gone_from_results_is_flagged(self):
+        email_on_page = {'app-9': (sync_prepare.email_document(self.email(id='app-9')), 3)}
+        writes = self.merge([], email_on_page)
+        self.assertEqual((writes[0]['data']['needsReview'], writes[0]['data']['reviewReason'], writes[0]['if_version']),
+                         (True, 'not_in_latest_scan', 3))
+        self.assertEqual(self.merge([], {'app-9': (writes[0]['data'], 4)}), [])
+
+    def test_skill_row_without_email_becomes_no_response_after_30_days(self):
+        writes = self.merge([], self.skill(appliedDate='2026-10-01', lastUpdate='2026-10-01'))
+        self.assertEqual(writes[0]['data']['status'], 'no response')
+        self.assertEqual(self.merge([], self.skill(appliedDate='2026-10-20')), [])
+
+    def test_unchanged_matched_row_writes_nothing(self):
+        first = self.merge([self.email()], self.skill())[0]
+        self.assertEqual(self.merge([self.email()], {first['doc_id']: (first['data'], 2)}), [])
+
+    def test_existing_email_row_without_origin_gets_it(self):
+        legacy = {'app-1': (sync_prepare.page_document(self.email()), 2)}
+        writes = self.merge([self.email()], legacy)
+        self.assertEqual(writes[0]['data']['origin'], 'email')
+
+    def test_review_rows_are_never_matched(self):
+        writes = self.merge([self.email(needsReview=True, reviewReason='unclear_status')], self.skill())
+        self.assertEqual([w['doc_id'] for w in writes], ['app-1'])
+
+
 class SyncTests(unittest.TestCase):
     def row(self, **changes):
         row = {'id': 'app-1', 'company': 'Acme', 'role': None, 'appliedDate': '2026-02-01', 'type': 'unknown',
@@ -735,6 +1101,31 @@ class SyncTests(unittest.TestCase):
                 json.dump(sync_prepare.page_document(self.row()), document)
             existing = sync_prepare.load_existing(folder, {'app-1': 4})
         self.assertEqual((existing['app-1'][1], existing['app-2'][1]), (4, 1))
+
+    def test_applied_plan_updates_the_local_copy(self):
+        with tempfile.TemporaryDirectory() as folder:
+            mirror, doc_path, plan_path = os.path.join(folder, 'mirror'), os.path.join(folder, 'doc.json'), os.path.join(folder, 'plan.json')
+            sync_prepare.save_mirror_row(mirror, 'gone', {'company': 'Old'})
+            with open(doc_path, 'w') as document:
+                json.dump({'company': 'Acme'}, document)
+            with open(plan_path, 'w') as plan_file:
+                json.dump([[{'op': 'set', 'doc_id': 'new', 'file_path': doc_path},
+                            {'op': 'delete', 'doc_id': 'gone', 'if_version': 1}]], plan_file)
+            sync_prepare.mark_applied(plan_path, os.path.join(folder, 'versions.json'), mirror)
+            self.assertEqual(sorted(os.listdir(mirror)), ['new.json'])
+            self.assertEqual(sync_prepare.load_existing(mirror)['new'][0], {'company': 'Acme'})
+            self.assertEqual(os.stat(os.path.join(mirror, 'new.json')).st_mode & 0o777, 0o600)
+
+    def test_seed_refuses_to_overwrite_a_local_copy(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = {'folder': folder, 'collection': 'c', 'source': os.path.join(folder, 'results.json'), 'rows': 'rows',
+                      'fields': sync_prepare.PAGE_FIELDS}
+            with open(target['source'], 'w') as results:
+                json.dump({'rows': [self.row()]}, results)
+            sync_prepare.seed_mirror(target)
+            self.assertEqual(list(sync_prepare.load_existing(sync_prepare.mirror_folder(target))), ['app-1'])
+            with self.assertRaises(SystemExit):
+                sync_prepare.seed_mirror(target)
 
     def test_versions_follow_an_applied_plan(self):
         plan = [[{'op': 'set', 'doc_id': 'new'}, {'op': 'set', 'doc_id': 'kept', 'if_version': 2},
@@ -843,12 +1234,12 @@ class SafetyTests(unittest.TestCase):
 
     def test_no_code_can_send_or_delete(self):
         forbidden = re.compile(r"\.(send|delete|trash|untrash|modify|batchModify|batchDelete|import_|insert)\(")
-        for name in ['gmail_client.py', 'track_applications.py', 'fetcher.py', 'sender.py', 'run.py', 'settings.py']:
+        for name in ['gmail_client.py', 'track_applications.py', 'recruiter_stats.py', 'recruiter_state.py', 'recruiter_classifier.py', 'fetcher.py', 'sender.py', 'run.py', 'settings.py']:
             with open(os.path.join(ROOT, name)) as source:
                 self.assertIsNone(forbidden.search(source.read()), name)
 
     def test_only_sender_touches_drafts_or_compose(self):
-        for name in ['gmail_client.py', 'track_applications.py', 'fetcher.py', 'run.py', 'settings.py']:
+        for name in ['gmail_client.py', 'track_applications.py', 'recruiter_stats.py', 'recruiter_state.py', 'recruiter_classifier.py', 'fetcher.py', 'run.py', 'settings.py']:
             with open(os.path.join(ROOT, name)) as source:
                 self.assertNotRegex(source.read(), r"drafts\(\)|GMAIL_COMPOSE_SCOPES", name)
 

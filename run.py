@@ -2,6 +2,7 @@ import argparse
 import sys
 
 import gmail_client
+import recruiter_classifier
 from settings import load_settings
 
 ORDER = ['tracker', 'recruiter']
@@ -19,9 +20,11 @@ def choose_features(command, features):
 
 def main():
     parser = argparse.ArgumentParser(description="Run the application tracker and/or the recruiter finder.")
-    parser.add_argument('command', nargs='?', choices=['tracker', 'recruiter', 'all'],
+    parser.add_argument('command', nargs='?', choices=['tracker', 'recruiter', 'outreach', 'all'],
                         help="Leave out to run whatever is switched on in settings.json")
     parser.add_argument('--full', action='store_true', help="Tracker: rescan from the start date")
+    parser.add_argument('--retry', action='store_true', help="Recruiter: search the full window again and redo deleted drafts")
+    parser.add_argument('--days', type=int, help="Recruiter: search this many days back instead of continuing from the last run")
     parser.add_argument('--limit', type=int, help="Tracker: read at most this many emails per account, saving no progress")
     args = parser.parse_args()
 
@@ -39,8 +42,11 @@ def main():
             failed = track_applications.run(settings, full=args.full, limit=args.limit)
         if 'recruiter' in chosen:
             import sender
-            sender.main()
-    except gmail_client.LoginNeeded as error:
+            sender.main(retry=args.retry, days=args.days)
+        if 'outreach' in chosen:
+            import recruiter_stats
+            recruiter_stats.run(settings)
+    except (gmail_client.LoginNeeded, recruiter_classifier.ModelUnavailable) as error:
         print(error)
         sys.exit(2)
 

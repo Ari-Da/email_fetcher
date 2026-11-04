@@ -108,24 +108,41 @@ def connect(account):
     return service
 
 
-# Yields every message ID for a query, following pagination to the end.
-def search_message_ids(service, query):
+# Yields every ID for a query, following pagination to the end.
+def search_ids(resource, key, query):
     page_token = None
     while True:
-        results = service.users().messages().list(
+        results = resource.list(
             userId="me", q=query, maxResults=PAGE_SIZE, pageToken=page_token
         ).execute(num_retries=GMAIL_RETRIES)
-        for message in results.get("messages", []):
-            yield message["id"]
+        for item in results.get(key, []):
+            yield item["id"]
         page_token = results.get("nextPageToken")
         if not page_token:
             return
+
+
+def search_message_ids(service, query):
+    return search_ids(service.users().messages(), "messages", query)
+
+
+def search_thread_ids(service, query):
+    return search_ids(service.users().threads(), "threads", query)
 
 
 def get_message(service, message_id):
     time.sleep(SECONDS_BETWEEN_READS)
     return service.users().messages().get(
         userId="me", id=message_id, format="full"
+    ).execute(num_retries=GMAIL_RETRIES)
+
+
+# Headers only: outreach stats never need an email's text.
+def get_thread(service, thread_id):
+    time.sleep(SECONDS_BETWEEN_READS)
+    return service.users().threads().get(
+        userId="me", id=thread_id, format="metadata",
+        metadataHeaders=["From", "To", "Subject", "Auto-Submitted"]
     ).execute(num_retries=GMAIL_RETRIES)
 
 

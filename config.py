@@ -8,8 +8,12 @@ CREDENTIALS_FILE = "credentials.json"
 TOKEN_SENDER_FILE = "tokens/token_sender.json"
 
 # Email fetching configuration
-MAX_RESULTS = 40
-DAYS_BACK = 120
+# How far back the first run searches. Later runs continue from the last run.
+DAYS_BACK = 30
+RECRUITER_OVERLAP_DAYS = 2
+# The local model that checks emails. Nothing leaves this Mac.
+RECRUITER_MODEL = "llama3.2:3b"
+OLLAMA_URL = "http://localhost:11434"
 
 # Email search keywords
 EMAIL_KEYWORDS = [
@@ -49,6 +53,8 @@ TRACKER_NO_RESPONSE_DAYS = 30
 TRACKER_OUTPUT_FILE = "data/applications.json"
 TRACKER_TEST_OUTPUT_FILE = "data/applications_test.json"
 TRACKER_STATE_FILE = "data/tracker_state.json"
+RECRUITER_OUTPUT_FILE = "data/recruiter_outreach.json"
+RECRUITER_STATE_FILE = "data/recruiter_state.json"
 # Each run looks back this far before the last scan, to catch late emails
 TRACKER_OVERLAP_DAYS = 2
 
@@ -66,7 +72,7 @@ TRACKER_SEARCH_PHRASES = [
 
 # Senders that act for many employers, so the domain never names the company
 TRACKER_ATS_DOMAINS = {
-    'greenhouse.io', 'greenhouse-mail.io', 'lever.co', 'ashbyhq.com',
+    'greenhouse.io', 'greenhouse-mail.io', 'greenhouse-jobs.com', 'lever.co', 'ashbyhq.com',
     'myworkday.com', 'myworkdayjobs.com', 'workday.com',
     'smartrecruiters.com', 'icims.com', 'jobvite.com', 'taleo.net',
     'successfactors.com', 'successfactors.eu', 'eightfold.ai',
