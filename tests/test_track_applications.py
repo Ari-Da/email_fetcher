@@ -1056,10 +1056,26 @@ class MergeTests(unittest.TestCase):
         first = self.merge([self.email()], self.skill())[0]
         self.assertEqual(self.merge([self.email()], {first['doc_id']: (first['data'], 2)}), [])
 
-    def test_existing_email_row_without_origin_gets_it(self):
+    def test_new_user_first_sync_writes_each_row_once(self):
+        # A new user starts with an empty tracker: the first sync adds every row,
+        # with its origin, and the next sync with the same emails writes nothing
+        rows = [self.email(id='app-1'), self.email(id='app-2', company='Globex', status='rejected')]
+        first = self.merge(rows, {})
+        self.assertEqual([w['op'] for w in first], ['set', 'set'])
+        self.assertTrue(all(w['data']['origin'] == 'email' for w in first))
+        saved = {w['doc_id']: (w['data'], 1) for w in first}
+        self.assertEqual(self.merge(rows, saved), [])
+
+    def test_existing_email_row_without_origin_is_not_rewritten(self):
+        # Rows saved before the origin label existed all came from email, so the
+        # missing label alone must not rewrite them
         legacy = {'app-1': (sync_prepare.page_document(self.email()), 2)}
-        writes = self.merge([self.email()], legacy)
-        self.assertEqual(writes[0]['data']['origin'], 'email')
+        self.assertEqual(self.merge([self.email()], legacy), [])
+
+    def test_existing_email_row_without_origin_gets_it_when_it_changes(self):
+        legacy = {'app-1': (sync_prepare.page_document(self.email()), 2)}
+        writes = self.merge([self.email(status='rejected')], legacy)
+        self.assertEqual((writes[0]['data']['origin'], writes[0]['data']['status']), ('email', 'rejected'))
 
     def test_review_rows_are_never_matched(self):
         writes = self.merge([self.email(needsReview=True, reviewReason='unclear_status')], self.skill())

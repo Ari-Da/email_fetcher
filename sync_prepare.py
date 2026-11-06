@@ -205,7 +205,10 @@ def email_document(row):
 def set_if_changed(writes, doc_id, document, saved, version):
     if saved is None:
         writes.append({'op': 'set', 'doc_id': doc_id, 'data': document})
-    elif {field: saved.get(field) for field in PAGE_FIELDS} != {field: document.get(field) for field in PAGE_FIELDS}:
+    # Rows written before the origin label existed all came from email, so a
+    # missing label alone is not a change worth rewriting the row for.
+    elif {field: saved.get(field) for field in PAGE_FIELDS} | {'origin': saved.get('origin') or 'email'} \
+            != {field: document.get(field) for field in PAGE_FIELDS}:
         writes.append({'op': 'set', 'doc_id': doc_id, 'data': document, 'if_version': version})
 
 
