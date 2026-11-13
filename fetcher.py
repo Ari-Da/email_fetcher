@@ -187,7 +187,8 @@ def fetch_account_emails(service, date_query):
             'company': company,
             'position': position,
             'bulk': is_bulk_email(headers, clean_text),
-            'text': clean_text
+            'text': clean_text,
+            'date': datetime.date.fromtimestamp(int(msg_detail['internalDate']) / 1000)
         })
 
         # Output

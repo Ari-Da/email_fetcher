@@ -110,6 +110,10 @@ def subject_contains_keywords(subject):
     # Subject must contain at least one keyword from either list
     return has_email_keyword or has_job_keyword
 
+# The day the recruiter wrote, e.g. "October 28, 2026", in place of {contact_date}
+def fill_draft_body(template, contact_date):
+    return template.replace('{contact_date}', f"{contact_date:%B} {contact_date.day}, {contact_date.year}")
+
 # Create a draft email in Gmail
 def create_draft_message(service, to_email, subject, body, from_email=None, attachment_path=None):
     # Create multipart message to support attachments
@@ -290,7 +294,7 @@ def main(retry=False, days=None):
         
         # Create draft
         try:
-            draft = create_draft_message(service, to_email, settings['draft_subject'], draft_body, destination_email, settings['attachment_file'])
+            draft = create_draft_message(service, to_email, settings['draft_subject'], fill_draft_body(draft_body, email_result['date']), destination_email, settings['attachment_file'])
             print("-" * 40)
             print(f"Draft created for: {to_email}")
             print(f"  From: {destination_email}")

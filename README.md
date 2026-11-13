@@ -57,7 +57,7 @@ See [Running](#running). Each account opens a browser login the first time.
 
 ## Settings
 
-Copy `settings.example.json` to `settings.json` and fill it in. Put the draft text in `draft_body.html`. Git ignores both, so addresses stay off GitHub. Never put personal values in `config.py`, which is public.
+Copy `settings.example.json` to `settings.json` and fill it in. Put the draft text in `draft_body.html`. Write `{contact_date}` where the draft should name the day the recruiter wrote, such as "October 28, 2026". Git ignores both, so addresses stay off GitHub. Never put personal values in `config.py`, which is public.
 
 - `features`: what `python run.py` runs, and so what a schedule runs
 - `recruiter_accounts`: inboxes the recruiter finder searches

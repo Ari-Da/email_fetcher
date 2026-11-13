@@ -842,6 +842,10 @@ class RecruiterMemoryTests(unittest.TestCase):
 
 
 class RecruiterFilterTests(unittest.TestCase):
+    def test_draft_names_the_day_the_recruiter_wrote(self):
+        body = sender.fill_draft_body("who you contacted on {contact_date} about", datetime.date(2026, 10, 3))
+        self.assertEqual(body, "who you contacted on October 3, 2026 about")
+
     def reason(self, to_email="sam@acme.com", subject="Opportunity at Acme", bulk=False):
         return sender.filter_reason(to_email, subject, bulk)
 
